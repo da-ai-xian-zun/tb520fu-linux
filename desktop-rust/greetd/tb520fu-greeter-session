@@ -1,0 +1,11 @@
+#!/bin/sh
+# Graphical Wayland greeter launcher for greetd on TB520FU (runs as user _greetd on vt7)
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=niri
+export RUST_BACKTRACE=0
+
+if command -v dbus-run-session >/dev/null 2>&1; then
+    exec dbus-run-session -- /usr/local/bin/niri -c /etc/greetd/niri-greeter.kdl
+else
+    exec /usr/local/bin/niri -c /etc/greetd/niri-greeter.kdl
+fi

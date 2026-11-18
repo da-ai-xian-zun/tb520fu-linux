@@ -1,0 +1,32 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Bring up the USB ACM gadget for the bring-up root shell on /dev/ttyGS0.
+set -eu
+G=/sys/kernel/config/usb_gadget/tb520fu
+
+i=0
+while [ -z "$(ls /sys/class/udc 2>/dev/null)" ]; do
+    i=$((i + 1))
+    [ "$i" -le 60 ] || { echo "no USB device controller after 60s" >&2; exit 1; }
+    sleep 1
+done
+UDC=$(ls /sys/class/udc | head -n 1)
+
+if [ ! -d "$G" ]; then
+    mkdir -p "$G/strings/0x409" "$G/configs/c.1/strings/0x409" "$G/functions/acm.usb0"
+    echo 0x1d6b > "$G/idVendor"
+    echo 0x0104 > "$G/idProduct"
+    echo TB520FU0001 > "$G/strings/0x409/serialnumber"
+    echo Lenovo > "$G/strings/0x409/manufacturer"
+    echo "TB520FU Debian console" > "$G/strings/0x409/product"
+    echo console > "$G/configs/c.1/strings/0x409/configuration"
+    ln -s "$G/functions/acm.usb0" "$G/configs/c.1/"
+fi
+[ -n "$(cat "$G/UDC")" ] || echo "$UDC" > "$G/UDC"
+
+i=0
+while [ ! -c /dev/ttyGS0 ]; do
+    i=$((i + 1))
+    [ "$i" -le 20 ] || { echo "/dev/ttyGS0 did not appear" >&2; exit 1; }
+    sleep 1
+done

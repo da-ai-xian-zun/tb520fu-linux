@@ -1,0 +1,2450 @@
+From 434be78c7168f537eb1bebb32e6e8198149e6b5f Mon Sep 17 00:00:00 2001
+From: da-ai-xian-zun <163512031+da-ai-xian-zun@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 01:49:44 -0500
+Subject: [PATCH] tb520fu: touch-window-and-touchpad
+
+---
+ src/input/mod.rs               | 193 +++++++-
+ src/input/touch_pinch.rs       |   3 +
+ src/input/touch_window_grab.rs | 789 +++++++++++++++++++++++++++++++++
+ src/layout/floating.rs         |  35 +-
+ src/layout/mod.rs              |  63 +++
+ src/layout/scrolling.rs        | 700 +++++++++++++++++++++++++++--
+ src/layout/tile.rs             |  68 ++-
+ src/layout/workspace.rs        | 154 ++++++-
+ src/niri.rs                    |  12 +
+ 9 files changed, 1951 insertions(+), 66 deletions(-)
+ create mode 100644 src/input/touch_window_grab.rs
+
+diff --git a/src/input/mod.rs b/src/input/mod.rs
+index 6c8d275f..719c27af 100644
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -67,6 +67,7 @@ pub mod touch_gate;
+ pub mod touch_overview_grab;
+ pub mod touch_pinch;
+ pub mod touch_resize_grab;
++pub mod touch_window_grab;
+ 
+ use backend_ext::{NiriInputBackend as InputBackend, NiriInputDevice as _};
+ 
+@@ -2891,7 +2892,38 @@ impl State {
+                 }
+             }
+ 
+-            if let Some(mapped) = self.niri.window_under_cursor() {
++            let mut tb520fu_pointer_grabbed = false;
++            if !is_overview_open
++                && button == Some(MouseButton::Left)
++                && !pointer.is_grabbed()
++                && !modifiers_from_state(mods).contains(mod_key.to_modifiers())
++                && self.niri.contents_under(pointer.current_location()).layer.is_none()
++            {
++                let location = pointer.current_location();
++                let tap_focus = self.niri.window_under_cursor().map(|m| m.window.clone());
++                if let Some((grab_target, should_grab)) =
++                    self.hit_touch_window_target(location, tap_focus, true)
++                {
++                    let is_pure_gap = self.niri.window_under_cursor().is_none();
++                    if should_grab || is_pure_gap {
++                        let start_data = PointerGrabStartData {
++                            focus: None,
++                            button: button_code,
++                            location,
++                        };
++                        let grab = self::touch_window_grab::PointerWindowGrab::new(
++                            start_data,
++                            grab_target,
++                        );
++                        pointer.set_grab(self, grab, serial, Focus::Clear);
++                        tb520fu_pointer_grabbed = true;
++                    }
++                }
++            }
++
++            if tb520fu_pointer_grabbed {
++                // Fall through to pointer.button() below so current_pressed() tracks LMB.
++            } else if let Some(mapped) = self.niri.window_under_cursor() {
+                 let window = mapped.window.clone();
+ 
+                 // Check if we need to start an interactive move.
+@@ -3836,21 +3868,24 @@ impl State {
+     }
+ 
+     fn on_gesture_swipe_begin<I: InputBackend>(&mut self, event: I::GestureSwipeBeginEvent) {
+-        if self.niri.window_mru_ui.is_open() {
++        if self.niri.is_locked() || self.niri.window_mru_ui.is_open() {
+             // Don't start swipe gestures while in the MRU.
+             return;
+         }
+ 
+         if event.fingers() == 3 {
++            if self.niri.is_tb520fu_curtain_open() {
++                self.niri.curtain_swipe_active = true;
++                self::touch_window_grab::send_tb520fu_shell_cmd("curtain-swipe-begin");
++                return;
++            }
+             self.niri.gesture_swipe_3f_cumulative = Some((0., 0.));
+ 
+             // We handled this event.
+             return;
+         } else if event.fingers() == 4 {
+-            self.niri.layout.overview_gesture_begin();
+-            self.niri.queue_redraw_all();
+-
+-            // We handled this event.
++            // TB520FU: 4-finger vertical swipe disabled on compact 128x75mm Pogo clickpad
++            // (Overview uses 3/4-finger pinch/spread; 3-finger vertical switches workspaces).
+             return;
+         }
+ 
+@@ -3889,6 +3924,14 @@ impl State {
+ 
+         let uninverted_delta_y = delta_y;
+ 
++        if self.niri.curtain_swipe_active {
++            self::touch_window_grab::send_tb520fu_shell_cmd(&format!(
++                "curtain-swipe {:.2}",
++                uninverted_delta_y
++            ));
++            return;
++        }
++
+         let device = event.device();
+         if let Some(device) = (&device as &dyn Any).downcast_ref::<input::Device>() {
+             if device.config_scroll_natural_scroll_enabled() {
+@@ -3994,6 +4037,11 @@ impl State {
+ 
+     fn on_gesture_swipe_end<I: InputBackend>(&mut self, event: I::GestureSwipeEndEvent) {
+         self.niri.gesture_swipe_3f_cumulative = None;
++        if self.niri.curtain_swipe_active {
++            self.niri.curtain_swipe_active = false;
++            self::touch_window_grab::send_tb520fu_shell_cmd("curtain-swipe-end");
++            return;
++        }
+ 
+         let mut handled = false;
+         let res = self.niri.layout.workspace_switch_gesture_end(Some(true));
+@@ -4037,6 +4085,17 @@ impl State {
+     }
+ 
+     fn on_gesture_pinch_begin<I: InputBackend>(&mut self, event: I::GesturePinchBeginEvent) {
++        if !self.niri.is_locked()
++            && !self.niri.window_mru_ui.is_open()
++            && !self.niri.is_tb520fu_curtain_open()
++            && (event.fingers() >= 3 || self.niri.layout.is_overview_open())
++        {
++            self.niri.touchpad_pinch_last_scale = Some(1.0);
++            self.niri.layout.overview_gesture_begin();
++            self.niri.queue_redraw_all();
++            return;
++        }
++
+         let serial = SERIAL_COUNTER.next_serial();
+         let pointer = self.niri.seat.get_pointer().unwrap();
+ 
+@@ -4055,6 +4114,18 @@ impl State {
+     }
+ 
+     fn on_gesture_pinch_update<I: InputBackend>(&mut self, event: I::GesturePinchUpdateEvent) {
++        if let Some(last_scale) = &mut self.niri.touchpad_pinch_last_scale {
++            let scale = event.scale();
++            let d_scale = *last_scale - scale;
++            *last_scale = scale;
++            let delta = d_scale * (300.0 / 0.42);
++            let timestamp = Duration::from_micros(event.time());
++            if let Some(true) = self.niri.layout.overview_gesture_update(delta, timestamp) {
++                self.niri.queue_redraw_all();
++            }
++            return;
++        }
++
+         let pointer = self.niri.seat.get_pointer().unwrap();
+ 
+         if self.update_pointer_contents() {
+@@ -4073,6 +4144,13 @@ impl State {
+     }
+ 
+     fn on_gesture_pinch_end<I: InputBackend>(&mut self, event: I::GesturePinchEndEvent) {
++        if self.niri.touchpad_pinch_last_scale.take().is_some() {
++            if self.niri.layout.overview_gesture_end() {
++                self.niri.queue_redraw_all();
++            }
++            return;
++        }
++
+         let serial = SERIAL_COUNTER.next_serial();
+         let pointer = self.niri.seat.get_pointer().unwrap();
+ 
+@@ -4146,6 +4224,75 @@ impl State {
+     /// Computes the cursor position for the touch event.
+     ///
+     /// This function handles the touch output mapping, as well as coordinate transform
++    fn hit_touch_window_target(
++        &self,
++        pos: Point<f64, Logical>,
++        tap_focus_window: Option<smithay::desktop::Window>,
++        is_pointer: bool,
++    ) -> Option<(self::touch_window_grab::WindowGrabTarget, bool)> {
++        use crate::layout::workspace::WorkspaceTouchHit;
++        use self::touch_window_grab::WindowGrabTarget;
++
++        if self.niri.is_locked()
++            || self.niri.exit_confirm_dialog.is_open()
++            || self.niri.screenshot_ui.is_open()
++            || self.niri.window_mru_ui.is_open()
++            || self.niri.layout.is_overview_open()
++        {
++            return None;
++        }
++        let (output, pos_within_output) = self.niri.output_under(pos)?;
++        let mon = self.niri.layout.monitor_for_output(output)?;
++        let (ws, ws_geo) = mon.workspace_under(pos_within_output)?;
++        let pos_within_ws = pos_within_output - ws_geo.loc;
++
++        match ws.touch_window_hit(pos_within_ws)? {
++            WorkspaceTouchHit::TopPill {
++                window: mapped,
++                pill_anchor_in_ws,
++                is_floating,
++            } => Some((
++                WindowGrabTarget::TopPill {
++                    window: mapped.window.clone(),
++                    win_id_u64: mapped.id().get(),
++                    pill_anchor_on_output: pill_anchor_in_ws + ws_geo.loc,
++                    is_floating,
++                    output: output.clone(),
++                    start_pos_within_output: pos_within_output,
++                },
++                true,
++            )),
++            WorkspaceTouchHit::FloatingEdge {
++                window: mapped,
++                edges,
++                inside_win,
++            } => Some((
++                WindowGrabTarget::FloatingEdge {
++                    window: mapped.window.clone(),
++                    edges,
++                    inside_win,
++                },
++                true,
++            )),
++            WorkspaceTouchHit::ScrollingSeam(seam) => {
++                let dist = seam.dist_from_seam();
++                let core_swallow = if is_pointer {
++                    dist <= 10.0
++                } else {
++                    dist <= 18.0
++                };
++                Some((
++                    WindowGrabTarget::ScrollingSeam {
++                        ws_id: ws.id(),
++                        seam,
++                        tap_focus_window,
++                    },
++                    core_swallow,
++                ))
++            }
++        }
++    }
++
+     fn compute_touch_location<I: InputBackend>(
+         &self,
+         evt: &impl AbsolutePositionEvent<I>,
+@@ -4216,7 +4363,39 @@ impl State {
+                 }
+             }
+         } else if !handle.is_grabbed() {
+-            if self.niri.layout.is_overview_open()
++            let mut tb520fu_grabbed = false;
++            if !self.niri.layout.is_overview_open()
++                && !mod_down
++                && under.layer.is_none()
++                && under.output.is_some()
++            {
++                let tap_focus = under.window.as_ref().map(|(w, _)| w.clone());
++                if let Some((grab_target, swallow_down)) =
++                    self.hit_touch_window_target(pos, tap_focus, false)
++                {
++                    let start_data = TouchGrabStartData {
++                        focus: None,
++                        slot,
++                        location: pos,
++                    };
++                    let grab = self::touch_window_grab::TouchWindowGrab::new(
++                        start_data,
++                        grab_target,
++                        swallow_down,
++                    );
++                    if swallow_down {
++                        self.niri.touch_gate.mark_not_tap(1);
++                    } else if let Some(output) = &under.output {
++                        self.niri.layout.focus_output(output);
++                    }
++                    handle.set_grab(self, grab, serial);
++                    tb520fu_grabbed = true;
++                }
++            }
++
++            if tb520fu_grabbed {
++                // Fall through to handle.down() below so TouchWindowGrab::down registers the slot.
++            } else if self.niri.layout.is_overview_open()
+                 && !mod_down
+                 && under.layer.is_none()
+                 && under.output.is_some()
+diff --git a/src/input/touch_pinch.rs b/src/input/touch_pinch.rs
+index a6de8fae..dd49fe61 100644
+--- a/src/input/touch_pinch.rs
++++ b/src/input/touch_pinch.rs
+@@ -132,6 +132,9 @@ impl State {
+ 
+     /// Returns true when the touch-down must not reach the seat (gesture in progress).
+     pub fn touch_pinch_down(&mut self, slot: TouchSlot, pos: Point<f64, Logical>) -> bool {
++        if self.niri.is_tb520fu_curtain_open() {
++            return false;
++        }
+         let p = &mut self.niri.touch_pinch;
+         p.points.insert(slot, pos);
+         if p.state != PinchState::Idle {
+diff --git a/src/input/touch_window_grab.rs b/src/input/touch_window_grab.rs
+new file mode 100644
+index 00000000..d226fcd0
+--- /dev/null
++++ b/src/input/touch_window_grab.rs
+@@ -0,0 +1,789 @@
++//! TB520FU: Compositor-native touch & pointer window manipulation:
++//! - Top-center `32x4` pill handle: tap opens `tb520fu-shell` Liquid Glass Window Menu,
++//!   drag runs 120Hz `interactive_move` without requiring keyboard `Mod`.
++//! - Floating windows (`prefer-no-csd`): extended border/corner hit zones run 120Hz `interactive_resize`.
++//! - Scrolling columns & stacks: coupled split-seam drag (`w_L + w_R = const` with `1/3 · 1/2 · 2/3`
++//!   detents & pinned viewport anchor), single-column outer-edge drag, stack row-seam drag, and
++//!   double-tap `50:50` reset.
++
++use std::io::Write;
++use std::os::unix::net::UnixStream;
++use std::time::Duration;
++
++use smithay::desktop::Window;
++use smithay::input::pointer::{
++    AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, GestureHoldBeginEvent,
++    GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent,
++    GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent,
++    GrabStartData as PointerGrabStartData, MotionEvent as PointerMotionEvent, PointerGrab,
++    PointerInnerHandle, RelativeMotionEvent,
++};
++use smithay::input::touch::{
++    DownEvent, GrabStartData as TouchGrabStartData, MotionEvent as TouchMotionEvent,
++    OrientationEvent, ShapeEvent, TouchGrab, TouchInnerHandle, UpEvent,
++};
++use smithay::input::SeatHandler;
++use smithay::output::Output;
++use smithay::utils::{IsAlive, Logical, Point};
++
++use crate::layout::scrolling::ScrollingSeamHit;
++use crate::layout::workspace::WorkspaceId;
++use crate::niri::State;
++use crate::utils::{get_monotonic_time, ResizeEdge};
++
++const PILL_DRAG_THRESHOLD: f64 = 7.0;
++const EDGE_DRAG_THRESHOLD: f64 = 6.0;
++const SEAM_CORE_DRAG_THRESHOLD: f64 = 3.5;
++const SEAM_HALO_DRAG_THRESHOLD: f64 = 6.0;
++const SEAM_DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(400);
++
++pub fn send_tb520fu_shell_cmd(cmd_line: &str) {
++    let path = if let Ok(rdir) = std::env::var("XDG_RUNTIME_DIR") {
++        let trimmed = rdir.trim().trim_end_matches('/');
++        if !trimmed.is_empty() {
++            format!("{trimmed}/tb520fu-shell.sock")
++        } else {
++            let uid = unsafe { libc::getuid() };
++            format!("/run/user/{uid}/tb520fu-shell.sock")
++        }
++    } else {
++        let uid = unsafe { libc::getuid() };
++        format!("/run/user/{uid}/tb520fu-shell.sock")
++    };
++    if let Ok(mut stream) = UnixStream::connect(path) {
++        let _ = stream.set_nonblocking(true);
++        let mut msg = cmd_line.trim().to_string();
++        msg.push('\n');
++        let _ = stream.write_all(msg.as_bytes());
++    }
++}
++
++#[derive(Clone)]
++pub enum WindowGrabTarget {
++    TopPill {
++        window: Window,
++        win_id_u64: u64,
++        pill_anchor_on_output: Point<f64, Logical>,
++        is_floating: bool,
++        output: Output,
++        start_pos_within_output: Point<f64, Logical>,
++    },
++    FloatingEdge {
++        window: Window,
++        edges: ResizeEdge,
++        inside_win: bool,
++    },
++    ScrollingSeam {
++        ws_id: WorkspaceId,
++        seam: ScrollingSeamHit<Window>,
++        tap_focus_window: Option<Window>,
++    },
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum ActivePhase {
++    Recognizing,
++    Moving,
++    ResizingFloating,
++    ResizingSeam,
++    Aborted,
++}
++
++pub struct TouchWindowGrab {
++    start_data: TouchGrabStartData<State>,
++    last_location: Point<f64, Logical>,
++    target: WindowGrabTarget,
++    swallow_down: bool,
++    phase: ActivePhase,
++}
++
++impl TouchWindowGrab {
++    pub fn new(
++        start_data: TouchGrabStartData<State>,
++        target: WindowGrabTarget,
++        swallow_down: bool,
++    ) -> Self {
++        let last_location = start_data.location;
++        Self {
++            start_data,
++            last_location,
++            target,
++            swallow_down,
++            phase: ActivePhase::Recognizing,
++        }
++    }
++
++    fn cleanup(&mut self, state: &mut State) {
++        match (&self.target, self.phase) {
++            (WindowGrabTarget::TopPill { window, .. }, ActivePhase::Moving) => {
++                state.niri.layout.interactive_move_end(window);
++                state.niri.queue_redraw_all();
++            }
++            (WindowGrabTarget::FloatingEdge { window, .. }, ActivePhase::ResizingFloating) => {
++                state.niri.layout.interactive_resize_end(window);
++                state.niri.queue_redraw_all();
++            }
++            (WindowGrabTarget::ScrollingSeam { ws_id, .. }, ActivePhase::ResizingSeam) => {
++                state.niri.layout.end_touch_seam_drag(*ws_id);
++                state.niri.queue_redraw_all();
++            }
++            _ => {}
++        }
++        self.phase = ActivePhase::Aborted;
++    }
++}
++
++impl TouchGrab<State> for TouchWindowGrab {
++    fn down(
++        &mut self,
++        data: &mut State,
++        handle: &mut TouchInnerHandle<'_, State>,
++        focus: Option<(<State as SeatHandler>::TouchFocus, Point<f64, Logical>)>,
++        event: &DownEvent,
++    ) {
++        if !self.swallow_down && event.slot == self.start_data.slot {
++            handle.down(data, focus, event);
++        } else {
++            handle.down(data, None, event);
++        }
++    }
++
++    fn up(
++        &mut self,
++        data: &mut State,
++        handle: &mut TouchInnerHandle<'_, State>,
++        event: &UpEvent,
++    ) {
++        handle.up(data, event);
++        if event.slot != self.start_data.slot {
++            return;
++        }
++
++        if self.phase == ActivePhase::Recognizing && !data.niri.touch_pinch.cancelling {
++            match &self.target {
++                WindowGrabTarget::TopPill {
++                    window,
++                    win_id_u64,
++                    pill_anchor_on_output,
++                    is_floating,
++                    ..
++                } => {
++                    if window.alive() {
++                        data.niri.layout.activate_window(window);
++                        data.niri.queue_redraw_all();
++                        send_tb520fu_shell_cmd(&format!(
++                            "win-menu {} {:.1} {:.1} {}",
++                            win_id_u64,
++                            pill_anchor_on_output.x,
++                            pill_anchor_on_output.y,
++                            if *is_floating { 1 } else { 0 }
++                        ));
++                    }
++                }
++                WindowGrabTarget::FloatingEdge {
++                    window, inside_win, ..
++                } => {
++                    if *inside_win && window.alive() {
++                        data.niri.layout.activate_window(window);
++                        data.niri.queue_redraw_all();
++                    }
++                }
++                WindowGrabTarget::ScrollingSeam {
++                    ws_id,
++                    seam,
++                    tap_focus_window,
++                } => {
++                    let now = get_monotonic_time();
++                    let pos = self.start_data.location;
++                    let is_double = data.niri.last_seam_tap.is_some_and(|(prev_t, prev_p)| {
++                        now.saturating_sub(prev_t) <= SEAM_DOUBLE_TAP_WINDOW
++                            && (pos.x - prev_p.x).hypot(pos.y - prev_p.y) <= 38.0
++                    });
++                    if is_double {
++                        data.niri.last_seam_tap = None;
++                        data.niri.touch_gate.mark_not_tap(1);
++                        if data.niri.layout.apply_touch_seam_double_tap(*ws_id, seam) {
++                            data.niri.queue_redraw_all();
++                        }
++                    } else {
++                        data.niri.last_seam_tap = Some((now, pos));
++                        if !self.swallow_down {
++                            if let Some(w) = tap_focus_window {
++                                if w.alive() {
++                                    data.niri.layout.activate_window(w);
++                                    data.niri.queue_redraw_all();
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++
++        handle.unset_grab(self, data);
++    }
++
++    fn motion(
++        &mut self,
++        data: &mut State,
++        handle: &mut TouchInnerHandle<'_, State>,
++        focus: Option<(<State as SeatHandler>::TouchFocus, Point<f64, Logical>)>,
++        event: &TouchMotionEvent,
++    ) {
++        if event.slot != self.start_data.slot {
++            handle.motion(data, None, event);
++            return;
++        }
++
++        let total_delta = event.location - self.start_data.location;
++        let step_delta = event.location - self.last_location;
++        self.last_location = event.location;
++
++        if self.phase == ActivePhase::Recognizing {
++            match &self.target {
++                WindowGrabTarget::TopPill {
++                    window,
++                    output,
++                    start_pos_within_output,
++                    ..
++                } => {
++                    handle.motion(data, None, event);
++                    if !window.alive() {
++                        handle.unset_grab(self, data);
++                        return;
++                    }
++                    if total_delta.x.hypot(total_delta.y) >= PILL_DRAG_THRESHOLD {
++                        data.niri.touch_gate.mark_not_tap(1);
++                        data.niri.layout.activate_window(window);
++                        if data.niri.layout.interactive_move_begin(
++                            window.clone(),
++                            output,
++                            *start_pos_within_output,
++                        ) {
++                            self.phase = ActivePhase::Moving;
++                            if let Some((out, pos_in_out)) = data.niri.output_under(event.location)
++                            {
++                                let out = out.clone();
++                                data.niri.layout.interactive_move_update(
++                                    window,
++                                    total_delta,
++                                    out,
++                                    pos_in_out,
++                                );
++                                data.niri.queue_redraw_all();
++                            }
++                        } else {
++                            handle.unset_grab(self, data);
++                        }
++                    }
++                    return;
++                }
++                WindowGrabTarget::FloatingEdge { window, edges, .. } => {
++                    handle.motion(data, None, event);
++                    if !window.alive() {
++                        handle.unset_grab(self, data);
++                        return;
++                    }
++                    if total_delta.x.hypot(total_delta.y) >= EDGE_DRAG_THRESHOLD {
++                        data.niri.touch_gate.mark_not_tap(1);
++                        data.niri.layout.activate_window(window);
++                        if data
++                            .niri
++                            .layout
++                            .interactive_resize_begin(window.clone(), *edges)
++                        {
++                            self.phase = ActivePhase::ResizingFloating;
++                            data.niri
++                                .layout
++                                .interactive_resize_update(window, total_delta);
++                            data.niri.queue_redraw_all();
++                        } else {
++                            handle.unset_grab(self, data);
++                        }
++                    }
++                    return;
++                }
++                WindowGrabTarget::ScrollingSeam { ws_id, seam, .. } => {
++                    let is_row = matches!(seam, ScrollingSeamHit::RowSeam { .. });
++                    let (along, perp) = if is_row {
++                        (total_delta.y.abs(), total_delta.x.abs())
++                    } else {
++                        (total_delta.x.abs(), total_delta.y.abs())
++                    };
++                    if !self.swallow_down && perp >= 24.0 && perp > along * 2.4 {
++                        // Strong perpendicular scroll inside window halo: yield to client!
++                        handle.motion(data, focus, event);
++                        self.phase = ActivePhase::Aborted;
++                        handle.unset_grab(self, data);
++                        return;
++                    }
++                    let thresh = if self.swallow_down {
++                        SEAM_CORE_DRAG_THRESHOLD
++                    } else {
++                        SEAM_HALO_DRAG_THRESHOLD
++                    };
++                    if along >= thresh && (self.swallow_down || along * 1.4 >= perp) {
++                        data.niri.touch_gate.mark_not_tap(1);
++                        if !self.swallow_down {
++                            handle.cancel(data);
++                        } else {
++                            handle.motion(data, None, event);
++                        }
++                        self.phase = ActivePhase::ResizingSeam;
++                        if data
++                            .niri
++                            .layout
++                            .apply_touch_seam_drag(*ws_id, seam, total_delta)
++                        {
++                            data.niri.queue_redraw_all();
++                        }
++                        return;
++                    }
++                    if self.swallow_down {
++                        handle.motion(data, None, event);
++                    } else {
++                        handle.motion(data, focus, event);
++                    }
++                    return;
++                }
++            }
++        }
++
++        handle.motion(data, None, event);
++
++        match (&self.target, self.phase) {
++            (WindowGrabTarget::TopPill { window, .. }, ActivePhase::Moving) => {
++                if !window.alive() {
++                    handle.unset_grab(self, data);
++                    return;
++                }
++                if let Some((out, pos_in_out)) = data.niri.output_under(event.location) {
++                    let out = out.clone();
++                    if data
++                        .niri
++                        .layout
++                        .interactive_move_update(window, step_delta, out, pos_in_out)
++                    {
++                        data.niri.queue_redraw_all();
++                    } else {
++                        handle.unset_grab(self, data);
++                    }
++                }
++            }
++            (WindowGrabTarget::FloatingEdge { window, .. }, ActivePhase::ResizingFloating) => {
++                if !window.alive()
++                    || !data
++                        .niri
++                        .layout
++                        .interactive_resize_update(window, total_delta)
++                {
++                    handle.unset_grab(self, data);
++                    return;
++                }
++                data.niri.queue_redraw_all();
++            }
++            (WindowGrabTarget::ScrollingSeam { ws_id, seam, .. }, ActivePhase::ResizingSeam) => {
++                if data
++                    .niri
++                    .layout
++                    .apply_touch_seam_drag(*ws_id, seam, total_delta)
++                {
++                    data.niri.queue_redraw_all();
++                }
++            }
++            _ => {}
++        }
++    }
++
++    fn frame(&mut self, data: &mut State, handle: &mut TouchInnerHandle<'_, State>) {
++        handle.frame(data);
++    }
++
++    fn cancel(&mut self, data: &mut State, handle: &mut TouchInnerHandle<'_, State>) {
++        handle.cancel(data);
++        handle.unset_grab(self, data);
++    }
++
++    fn shape(
++        &mut self,
++        data: &mut State,
++        handle: &mut TouchInnerHandle<'_, State>,
++        event: &ShapeEvent,
++    ) {
++        handle.shape(data, event);
++    }
++
++    fn orientation(
++        &mut self,
++        data: &mut State,
++        handle: &mut TouchInnerHandle<'_, State>,
++        event: &OrientationEvent,
++    ) {
++        handle.orientation(data, event);
++    }
++
++    fn start_data(&self) -> &TouchGrabStartData<State> {
++        &self.start_data
++    }
++
++    fn unset(&mut self, data: &mut State) {
++        self.cleanup(data);
++    }
++}
++
++pub struct PointerWindowGrab {
++    start_data: PointerGrabStartData<State>,
++    last_location: Point<f64, Logical>,
++    target: WindowGrabTarget,
++    phase: ActivePhase,
++}
++
++impl PointerWindowGrab {
++    pub fn new(start_data: PointerGrabStartData<State>, target: WindowGrabTarget) -> Self {
++        let last_location = start_data.location;
++        Self {
++            start_data,
++            last_location,
++            target,
++            phase: ActivePhase::Recognizing,
++        }
++    }
++
++    fn cleanup(&mut self, state: &mut State) {
++        match (&self.target, self.phase) {
++            (WindowGrabTarget::TopPill { window, .. }, ActivePhase::Moving) => {
++                state.niri.layout.interactive_move_end(window);
++                state
++                    .niri
++                    .cursor_manager
++                    .set_cursor_image(CursorImageStatus::default_named());
++                state.niri.queue_redraw_all();
++            }
++            (WindowGrabTarget::FloatingEdge { window, .. }, ActivePhase::ResizingFloating) => {
++                state.niri.layout.interactive_resize_end(window);
++                state
++                    .niri
++                    .cursor_manager
++                    .set_cursor_image(CursorImageStatus::default_named());
++                state.niri.queue_redraw_all();
++            }
++            (WindowGrabTarget::ScrollingSeam { ws_id, .. }, ActivePhase::ResizingSeam) => {
++                state.niri.layout.end_touch_seam_drag(*ws_id);
++                state
++                    .niri
++                    .cursor_manager
++                    .set_cursor_image(CursorImageStatus::default_named());
++                state.niri.queue_redraw_all();
++            }
++            _ => {}
++        }
++        self.phase = ActivePhase::Aborted;
++    }
++}
++
++impl PointerGrab<State> for PointerWindowGrab {
++    fn motion(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        _focus: Option<(<State as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
++        event: &PointerMotionEvent,
++    ) {
++        handle.motion(data, None, event);
++
++        let total_delta = event.location - self.start_data.location;
++        let step_delta = event.location - self.last_location;
++        self.last_location = event.location;
++
++        if self.phase == ActivePhase::Recognizing {
++            match &self.target {
++                WindowGrabTarget::TopPill {
++                    window,
++                    output,
++                    start_pos_within_output,
++                    ..
++                } => {
++                    if total_delta.x.hypot(total_delta.y) >= 5.0 && window.alive() {
++                        data.niri.layout.activate_window(window);
++                        if data.niri.layout.interactive_move_begin(
++                            window.clone(),
++                            output,
++                            *start_pos_within_output,
++                        ) {
++                            self.phase = ActivePhase::Moving;
++                            data.niri
++                                .cursor_manager
++                                .set_cursor_image(CursorImageStatus::Named(CursorIcon::Grabbing));
++                            if let Some((out, pos_in_out)) = data.niri.output_under(event.location)
++                            {
++                                let out = out.clone();
++                                data.niri.layout.interactive_move_update(
++                                    window,
++                                    total_delta,
++                                    out,
++                                    pos_in_out,
++                                );
++                                data.niri.queue_redraw_all();
++                            }
++                        }
++                    }
++                    return;
++                }
++                WindowGrabTarget::FloatingEdge { window, edges, .. } => {
++                    if total_delta.x.hypot(total_delta.y) >= 4.0 && window.alive() {
++                        data.niri.layout.activate_window(window);
++                        if data
++                            .niri
++                            .layout
++                            .interactive_resize_begin(window.clone(), *edges)
++                        {
++                            self.phase = ActivePhase::ResizingFloating;
++                            data.niri
++                                .cursor_manager
++                                .set_cursor_image(CursorImageStatus::Named(edges.cursor_icon()));
++                            data.niri
++                                .layout
++                                .interactive_resize_update(window, total_delta);
++                            data.niri.queue_redraw_all();
++                        }
++                    }
++                    return;
++                }
++                WindowGrabTarget::ScrollingSeam { ws_id, seam, .. } => {
++                    let is_row = matches!(seam, ScrollingSeamHit::RowSeam { .. });
++                    let along = if is_row {
++                        total_delta.y.abs()
++                    } else {
++                        total_delta.x.abs()
++                    };
++                    if along >= 3.5 {
++                        self.phase = ActivePhase::ResizingSeam;
++                        let icon = if is_row {
++                            CursorIcon::RowResize
++                        } else {
++                            CursorIcon::ColResize
++                        };
++                        data.niri
++                            .cursor_manager
++                            .set_cursor_image(CursorImageStatus::Named(icon));
++                        if data
++                            .niri
++                            .layout
++                            .apply_touch_seam_drag(*ws_id, seam, total_delta)
++                        {
++                            data.niri.queue_redraw_all();
++                        }
++                    }
++                    return;
++                }
++            }
++        }
++
++        match (&self.target, self.phase) {
++            (WindowGrabTarget::TopPill { window, .. }, ActivePhase::Moving) => {
++                if let Some((out, pos_in_out)) = data.niri.output_under(event.location) {
++                    let out = out.clone();
++                    if data
++                        .niri
++                        .layout
++                        .interactive_move_update(window, step_delta, out, pos_in_out)
++                    {
++                        data.niri.queue_redraw_all();
++                        return;
++                    }
++                }
++                handle.unset_grab(self, data, event.serial, event.time, true);
++            }
++            (WindowGrabTarget::FloatingEdge { window, .. }, ActivePhase::ResizingFloating) => {
++                if window.alive()
++                    && data
++                        .niri
++                        .layout
++                        .interactive_resize_update(window, total_delta)
++                {
++                    data.niri.queue_redraw_all();
++                    return;
++                }
++                handle.unset_grab(self, data, event.serial, event.time, true);
++            }
++            (WindowGrabTarget::ScrollingSeam { ws_id, seam, .. }, ActivePhase::ResizingSeam) => {
++                if data
++                    .niri
++                    .layout
++                    .apply_touch_seam_drag(*ws_id, seam, total_delta)
++                {
++                    data.niri.queue_redraw_all();
++                }
++            }
++            _ => {}
++        }
++    }
++
++    fn relative_motion(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        _focus: Option<(<State as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
++        event: &RelativeMotionEvent,
++    ) {
++        handle.relative_motion(data, None, event);
++    }
++
++    fn button(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        event: &ButtonEvent,
++    ) {
++        handle.button(data, event);
++        if !handle.current_pressed().is_empty() {
++            return;
++        }
++
++        if self.phase == ActivePhase::Recognizing {
++            match &self.target {
++                WindowGrabTarget::TopPill {
++                    window,
++                    win_id_u64,
++                    pill_anchor_on_output,
++                    is_floating,
++                    ..
++                } => {
++                    if window.alive() {
++                        data.niri.layout.activate_window(window);
++                        data.niri.queue_redraw_all();
++                        send_tb520fu_shell_cmd(&format!(
++                            "win-menu {} {:.1} {:.1} {}",
++                            win_id_u64,
++                            pill_anchor_on_output.x,
++                            pill_anchor_on_output.y,
++                            if *is_floating { 1 } else { 0 }
++                        ));
++                    }
++                }
++                WindowGrabTarget::ScrollingSeam {
++                    ws_id,
++                    seam,
++                    tap_focus_window,
++                } => {
++                    let now = get_monotonic_time();
++                    let pos = self.start_data.location;
++                    let is_double = data.niri.last_seam_tap.is_some_and(|(prev_t, prev_p)| {
++                        now.saturating_sub(prev_t) <= SEAM_DOUBLE_TAP_WINDOW
++                            && (pos.x - prev_p.x).hypot(pos.y - prev_p.y) <= 28.0
++                    });
++                    if is_double {
++                        data.niri.last_seam_tap = None;
++                        if data.niri.layout.apply_touch_seam_double_tap(*ws_id, seam) {
++                            data.niri.queue_redraw_all();
++                        }
++                    } else {
++                        data.niri.last_seam_tap = Some((now, pos));
++                        if let Some(w) = tap_focus_window {
++                            if w.alive() {
++                                data.niri.layout.activate_window(w);
++                                data.niri.queue_redraw_all();
++                            }
++                        }
++                    }
++                }
++                _ => {}
++            }
++        }
++
++        handle.unset_grab(self, data, event.serial, event.time, true);
++    }
++
++    fn axis(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        details: AxisFrame,
++    ) {
++        handle.axis(data, details);
++    }
++
++    fn frame(&mut self, data: &mut State, handle: &mut PointerInnerHandle<'_, State>) {
++        handle.frame(data);
++    }
++
++    fn gesture_swipe_begin(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        event: &GestureSwipeBeginEvent,
++    ) {
++        handle.gesture_swipe_begin(data, event);
++    }
++
++    fn gesture_swipe_update(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        event: &GestureSwipeUpdateEvent,
++    ) {
++        handle.gesture_swipe_update(data, event);
++    }
++
++    fn gesture_swipe_end(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        event: &GestureSwipeEndEvent,
++    ) {
++        handle.gesture_swipe_end(data, event);
++    }
++
++    fn gesture_pinch_begin(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        event: &GesturePinchBeginEvent,
++    ) {
++        handle.gesture_pinch_begin(data, event);
++    }
++
++    fn gesture_pinch_update(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        event: &GesturePinchUpdateEvent,
++    ) {
++        handle.gesture_pinch_update(data, event);
++    }
++
++    fn gesture_pinch_end(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        event: &GesturePinchEndEvent,
++    ) {
++        handle.gesture_pinch_end(data, event);
++    }
++
++    fn gesture_hold_begin(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        event: &GestureHoldBeginEvent,
++    ) {
++        handle.gesture_hold_begin(data, event);
++    }
++
++    fn gesture_hold_end(
++        &mut self,
++        data: &mut State,
++        handle: &mut PointerInnerHandle<'_, State>,
++        event: &GestureHoldEndEvent,
++    ) {
++        handle.gesture_hold_end(data, event);
++    }
++
++    fn start_data(&self) -> &PointerGrabStartData<State> {
++        &self.start_data
++    }
++
++    fn unset(&mut self, data: &mut State) {
++        self.cleanup(data);
++    }
++}
+diff --git a/src/layout/floating.rs b/src/layout/floating.rs
+index 075787fd..201fd5f5 100644
+--- a/src/layout/floating.rs
++++ b/src/layout/floating.rs
+@@ -1057,18 +1057,28 @@ impl<W: LayoutElement> FloatingSpace<W> {
+     }
+ 
+     pub fn render<R: NiriRenderer>(
++        &self,
++        ctx: RenderCtx<R>,
++        xray_pos: XrayPos,
++        view_rect: Rectangle<f64, Logical>,
++        focus_ring: bool,
++        push: &mut dyn FnMut(FloatingSpaceRenderElement<R>),
++    ) {
++        self.render_with_pills(ctx, xray_pos, view_rect, focus_ring, focus_ring, push);
++    }
++
++    pub fn render_with_pills<R: NiriRenderer>(
+         &self,
+         mut ctx: RenderCtx<R>,
+         xray_pos: XrayPos,
+         view_rect: Rectangle<f64, Logical>,
+         focus_ring: bool,
++        show_pills: bool,
+         push: &mut dyn FnMut(FloatingSpaceRenderElement<R>),
+     ) {
+         let scale = Scale::from(self.scale);
+ 
+         // Draw the closing windows on top of the other windows.
+-        //
+-        // FIXME: I guess this should rather preserve the stacking order when the window is closed.
+         for closing in self.closing_windows.iter().rev() {
+             let elem = closing.render(ctx.as_gles(), view_rect, scale);
+             push(elem.into());
+@@ -1076,13 +1086,24 @@ impl<W: LayoutElement> FloatingSpace<W> {
+ 
+         let active = self.active_window_id.clone();
+         for (tile, tile_pos) in self.tiles_with_render_positions() {
+-            // For the active tile, draw the focus ring.
+-            let focus_ring = focus_ring && Some(tile.window().id()) == active.as_ref();
++            let tile_focus_ring = focus_ring && Some(tile.window().id()) == active.as_ref();
++            let pill_alpha = if !show_pills {
++                0.0
++            } else if tile_focus_ring {
++                0.78
++            } else {
++                0.44
++            };
+ 
+             let xray_pos = xray_pos.offset(tile_pos);
+-            tile.render(ctx.r(), tile_pos, xray_pos, focus_ring, &mut |elem| {
+-                push(elem.into())
+-            });
++            tile.render_with_pill(
++                ctx.r(),
++                tile_pos,
++                xray_pos,
++                tile_focus_ring,
++                pill_alpha,
++                &mut |elem| push(elem.into()),
++            );
+         }
+     }
+ 
+diff --git a/src/layout/mod.rs b/src/layout/mod.rs
+index 000772ff..05e5e47b 100644
+--- a/src/layout/mod.rs
++++ b/src/layout/mod.rs
+@@ -1249,6 +1249,69 @@ impl<W: LayoutElement> Layout<W> {
+         }
+     }
+ 
++    pub fn apply_touch_seam_drag(
++        &mut self,
++        id: WorkspaceId,
++        hit: &scrolling::ScrollingSeamHit<W::Id>,
++        delta: Point<f64, Logical>,
++    ) -> bool {
++        match &mut self.monitor_set {
++            MonitorSet::Normal { monitors, .. } => {
++                for mon in monitors {
++                    if let Some(ws) = mon.workspaces.iter_mut().find(|w| w.id() == id) {
++                        return ws.apply_touch_seam_drag(hit, delta);
++                    }
++                }
++            }
++            MonitorSet::NoOutputs { workspaces } => {
++                if let Some(ws) = workspaces.iter_mut().find(|w| w.id() == id) {
++                    return ws.apply_touch_seam_drag(hit, delta);
++                }
++            }
++        }
++        false
++    }
++
++    pub fn end_touch_seam_drag(&mut self, id: WorkspaceId) {
++        match &mut self.monitor_set {
++            MonitorSet::Normal { monitors, .. } => {
++                for mon in monitors {
++                    if let Some(ws) = mon.workspaces.iter_mut().find(|w| w.id() == id) {
++                        ws.end_touch_seam_drag();
++                        return;
++                    }
++                }
++            }
++            MonitorSet::NoOutputs { workspaces } => {
++                if let Some(ws) = workspaces.iter_mut().find(|w| w.id() == id) {
++                    ws.end_touch_seam_drag();
++                }
++            }
++        }
++    }
++
++    pub fn apply_touch_seam_double_tap(
++        &mut self,
++        id: WorkspaceId,
++        hit: &scrolling::ScrollingSeamHit<W::Id>,
++    ) -> bool {
++        match &mut self.monitor_set {
++            MonitorSet::Normal { monitors, .. } => {
++                for mon in monitors {
++                    if let Some(ws) = mon.workspaces.iter_mut().find(|w| w.id() == id) {
++                        return ws.apply_touch_seam_double_tap(hit);
++                    }
++                }
++            }
++            MonitorSet::NoOutputs { workspaces } => {
++                if let Some(ws) = workspaces.iter_mut().find(|w| w.id() == id) {
++                    return ws.apply_touch_seam_double_tap(hit);
++                }
++            }
++        }
++        false
++    }
++
+     pub fn find_workspace_by_id(&self, id: WorkspaceId) -> Option<(usize, &Workspace<W>)> {
+         match &self.monitor_set {
+             MonitorSet::Normal { ref monitors, .. } => {
+diff --git a/src/layout/scrolling.rs b/src/layout/scrolling.rs
+index 9739abdf..fc6b1d73 100644
+--- a/src/layout/scrolling.rs
++++ b/src/layout/scrolling.rs
+@@ -45,6 +45,12 @@ pub struct ScrollingSpace<W: LayoutElement> {
+     /// Ongoing interactive resize.
+     interactive_resize: Option<InteractiveResize<W>>,
+ 
++    /// TB520FU: Ongoing compositor-native touch/pointer seam resize.
++    seam_resize: Option<ActiveSeamResize>,
++
++    /// TB520FU: Viewport anchor preserving split-pair screen alignment across async Wayland commits.
++    seam_viewport_anchor: Option<(ViewportAnchor, Duration)>,
++
+     /// Offset of the view computed from the active column.
+     ///
+     /// Any gaps, including left padding from work area left exclusive zone, is handled
+@@ -270,6 +276,61 @@ pub enum WindowHeight {
+ ///
+ /// As operations often have a symmetrical counterpart, e.g. focus-right/focus-left, methods
+ /// on `Scrolling` can sometimes be factored using the direction of the operation as a parameter.
++#[derive(Debug, Clone, Copy)]
++enum ViewportAnchor {
++    /// Pin `column_x(col_idx) - view_pos == screen_x` (keeps column's left edge stationary).
++    ColLeft { col_idx: usize, screen_x: f64 },
++    /// Pin `column_x(col_idx) + data[col_idx].width - view_pos == screen_x` (keeps column's right edge stationary).
++    ColRight { col_idx: usize, screen_x: f64 },
++}
++
++#[derive(Debug, Clone, Copy)]
++struct ActiveSeamResize {
++    cols: [Option<(usize, ResizeEdge)>; 2],
++    last_applied_px: (i32, i32),
++}
++
++#[derive(Debug, Clone)]
++pub enum ScrollingSeamHit<I> {
++    ColSeam {
++        left_col_idx: usize,
++        coupled: bool,
++        left_prop_0: f64,
++        right_prop_0: f64,
++        start_left_x: f64,
++        work_w: f64,
++        gaps: f64,
++        dist_from_seam: f64,
++    },
++    OuterEdge {
++        col_idx: usize,
++        is_left_edge: bool,
++        prop_0: f64,
++        start_left_x: f64,
++        start_right_x: f64,
++        centered: bool,
++        work_w: f64,
++        gaps: f64,
++        dist_from_seam: f64,
++    },
++    RowSeam {
++        col_idx: usize,
++        upper_win_id: I,
++        start_upper_h: f64,
++        dist_from_seam: f64,
++    },
++}
++
++impl<I> ScrollingSeamHit<I> {
++    pub fn dist_from_seam(&self) -> f64 {
++        match self {
++            Self::ColSeam { dist_from_seam, .. }
++            | Self::OuterEdge { dist_from_seam, .. }
++            | Self::RowSeam { dist_from_seam, .. } => *dist_from_seam,
++        }
++    }
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq)]
+ pub enum ScrollDirection {
+     Left,
+@@ -297,6 +358,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+             data: Vec::new(),
+             active_column_idx: 0,
+             interactive_resize: None,
++            seam_resize: None,
++            seam_viewport_anchor: None,
+             view_offset: ViewOffset::Static(0.),
+             activate_prev_column_on_removal: None,
+             view_offset_to_restore: None,
+@@ -795,6 +858,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+             self.activate_prev_column_on_removal = None;
+             self.view_offset_to_restore = None;
+             self.interactive_resize = None;
++            self.seam_resize = None;
++            self.seam_viewport_anchor = None;
+         }
+     }
+ 
+@@ -834,35 +899,48 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+             return InsertPosition::NewColumn(closest_col_idx);
+         }
+ 
+-        // Find the closest gap between tiles.
++        // TB520FU: Intuitive top-pill drag zones inside a target column:
++        // - Outer 20% left/right strips (or top horizontal-skim corridor): NewColumn (swap/unstack)
++        // - Central 60% body + lower half (`pos.y >= tile_mid`): stack below target tile (`InColumn`)
++        // - Central 60% body + upper-middle body: stack above target tile (`InColumn`)
+         let col = &self.columns[col_idx];
++        let col_start_x = self.column_x(col_idx);
++        let col_w = self.data[col_idx].width;
++        let raw_x = pos.x + self.view_pos();
++        let local_x = raw_x - col_start_x;
++        let side_band = (col_w * 0.20).clamp(56.0, 150.0);
+ 
+-        let (closest_tile_idx, tile_y) = if col.display_mode == ColumnDisplay::Tabbed {
+-            // In tabbed mode, there's only one tile visible, and we want to check its top and
+-            // bottom.
++        if local_x < side_band || local_x > col_w - side_band {
++            return InsertPosition::NewColumn(closest_col_idx);
++        }
++
++        let col_top = col.tiles_origin().y;
++        let col_h = (self.working_area.size.h - self.options.layout.gaps * 2.).max(120.0);
++        let top_skim_limit = col_top + (col_h * 0.16).clamp(96.0, 148.0);
++        if pos.y < top_skim_limit {
++            return InsertPosition::NewColumn(closest_col_idx);
++        }
++
++        let target_tile_idx = if col.display_mode == ColumnDisplay::Tabbed {
+             let top = col.tile_offsets().nth(col.active_tile_idx).unwrap().y;
+-            let bottom = top + col.data[col.active_tile_idx].size.h;
+-            if (top - y).abs() <= (bottom - y).abs() {
+-                (col.active_tile_idx, top)
++            let mid = top + col.data[col.active_tile_idx].size.h * 0.5;
++            if pos.y >= mid {
++                col.active_tile_idx + 1
+             } else {
+-                (col.active_tile_idx + 1, bottom)
++                col.active_tile_idx
+             }
+         } else {
+-            col.tile_offsets()
+-                .map(|tile_off| tile_off.y)
++            col.tiles()
++                .zip(&col.data)
+                 .enumerate()
+-                .min_by_key(|(_, tile_y)| NotNan::new((tile_y - y).abs()).unwrap())
+-                .unwrap()
++                .find_map(|(idx, ((_, tile_off), tdata))| {
++                    let mid = tile_off.y + tdata.size.h * 0.5;
++                    (pos.y < mid).then_some(idx)
++                })
++                .unwrap_or(col.tiles.len())
+         };
+ 
+-        // Return the closest among the vertical and the horizontal gap.
+-        let vert_dist = (col_x - x).abs();
+-        let hor_dist = (tile_y - y).abs();
+-        if vert_dist <= hor_dist {
+-            InsertPosition::NewColumn(closest_col_idx)
+-        } else {
+-            InsertPosition::InColumn(col_idx, closest_tile_idx)
+-        }
++        InsertPosition::InColumn(col_idx, target_tile_idx)
+     }
+ 
+     pub fn add_tile(
+@@ -967,6 +1045,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+         activate: bool,
+         anim_config: Option<niri_config::Animation>,
+     ) {
++        self.seam_resize = None;
++        self.seam_viewport_anchor = None;
+         let was_empty = self.columns.is_empty();
+ 
+         let idx = idx.unwrap_or_else(|| {
+@@ -1164,6 +1244,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+         column_idx: usize,
+         anim_config: Option<niri_config::Animation>,
+     ) -> Column<W> {
++        self.seam_resize = None;
++        self.seam_viewport_anchor = None;
+         // Animate movement of the other columns.
+         let movement_config = anim_config.unwrap_or(self.options.animations.window_movement.0);
+         let offset = self.column_x(column_idx + 1) - self.column_x(column_idx);
+@@ -1335,6 +1417,38 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+             }
+         }
+ 
++        if let Some(anchor) = self.active_seam_anchor() {
++            if self.columns[self.active_column_idx].sizing_mode().is_normal()
++                && self.columns[col_idx].sizing_mode().is_normal()
++            {
++                let desired_view_pos = match anchor {
++                    ViewportAnchor::ColLeft {
++                        col_idx: a_idx,
++                        screen_x,
++                    } => self.column_x(a_idx) - screen_x,
++                    ViewportAnchor::ColRight {
++                        col_idx: a_idx,
++                        screen_x,
++                    } => self.column_x(a_idx) + self.data[a_idx].width - screen_x,
++                };
++                let desired_offset = desired_view_pos - self.column_x(self.active_column_idx);
++                if self.seam_resize.is_some() || !ongoing_resize_anim {
++                    for col in &mut self.columns {
++                        col.move_animation = None;
++                    }
++                    self.view_offset = ViewOffset::Static(desired_offset);
++                } else {
++                    self.animate_view_offset_with_config(
++                        self.active_column_idx,
++                        desired_offset,
++                        self.options.animations.window_resize.anim,
++                    );
++                }
++                return;
++            }
++            self.seam_viewport_anchor = None;
++        }
++
+         if col_idx == self.active_column_idx {
+             // If offset == 0, then don't mess with the view or the gesture. Some clients (Firefox,
+             // Chromium, Electron) currently don't commit after the ack of a configure that drops
+@@ -2418,14 +2532,25 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+     }
+ 
+     pub fn tiles_with_ipc_layouts(&self) -> impl Iterator<Item = (&Tile<W>, WindowLayout)> {
+-        self.columns
+-            .iter()
++        let scale = self.scale;
++        let target_view_off = if self.columns.is_empty() {
++            Point::from((0., 0.))
++        } else {
++            Point::from((-self.target_view_pos(), 0.))
++        };
++        let col_xs = self.column_xs(self.data.iter().copied());
++        zip(&self.columns, col_xs)
+             .enumerate()
+-            .flat_map(move |(col_idx, col)| {
+-                col.tiles().enumerate().map(move |(tile_idx, (tile, _))| {
++            .flat_map(move |(col_idx, (col, col_x))| {
++                let col_off = Point::from((col_x, 0.));
++                col.tiles().enumerate().map(move |(tile_idx, (tile, tile_off))| {
++                    let pos = (target_view_off + col_off + tile_off)
++                        .to_physical_precise_round(scale)
++                        .to_logical(scale);
+                     let layout = WindowLayout {
+                         // Our indices are 1-based, consistent with the actions.
+                         pos_in_scrolling_layout: Some((col_idx + 1, tile_idx + 1)),
++                        tile_pos_in_workspace_view: Some(pos.into()),
+                         ..tile.ipc_layout_template()
+                     };
+                     (tile, layout)
+@@ -2608,6 +2733,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+         if self.columns.is_empty() {
+             return;
+         }
++        self.seam_viewport_anchor = None;
+ 
+         let (col, tile_idx) = if let Some(window) = window {
+             self.columns
+@@ -2899,15 +3025,25 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+     }
+ 
+     pub fn render<R: NiriRenderer>(
++        &self,
++        ctx: RenderCtx<R>,
++        xray_pos: XrayPos,
++        focus_ring: bool,
++        push: &mut dyn FnMut(ScrollingSpaceRenderElement<R>),
++    ) {
++        self.render_with_pills(ctx, xray_pos, focus_ring, focus_ring, push);
++    }
++
++    pub fn render_with_pills<R: NiriRenderer>(
+         &self,
+         mut ctx: RenderCtx<R>,
+         xray_pos: XrayPos,
+         focus_ring: bool,
++        show_pills: bool,
+         push: &mut dyn FnMut(ScrollingSpaceRenderElement<R>),
+     ) {
+         let scale = Scale::from(self.scale);
+ 
+-        // Draw the closing windows on top of the other windows.
+         let view_rect = Rectangle::new(Point::from((self.view_pos(), 0.)), self.view_size);
+         for closing in self.closing_windows.iter().rev() {
+             let elem = closing.render(ctx.as_gles(), view_rect, scale);
+@@ -2920,13 +3056,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+ 
+         let mut first = true;
+ 
+-        // This matches self.tiles_in_render_order().
+         let view_off = Point::from((-self.view_pos(), 0.));
+         for (col, col_x) in self.columns_in_render_order() {
+             let col_off = Point::from((col_x, 0.));
+             let col_render_off = col.render_offset();
+ 
+-            // Draw the tab indicator on top.
+             {
+                 let pos = view_off + col_off + col_render_off;
+                 let pos = pos.to_physical_precise_round(scale).to_logical(scale);
+@@ -2937,29 +3071,32 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+             for (tile, tile_off, visible) in col.tiles_in_render_order() {
+                 let tile_pos =
+                     view_off + col_off + col_render_off + tile_off + tile.render_offset();
+-                // Round to physical pixels.
+                 let tile_pos = tile_pos.to_physical_precise_round(scale).to_logical(scale);
+ 
+-                // And now the drawing logic.
+-
+-                // For the active tile (which comes first), draw the focus ring.
+-                let focus_ring = focus_ring && first;
++                let tile_focus_ring = focus_ring && first;
++                let pill_alpha = if !show_pills {
++                    0.0
++                } else if tile_focus_ring {
++                    0.72
++                } else {
++                    0.35
++                };
+                 first = false;
+ 
+-                // In the scrolling layout, we currently use visible only for hidden tabs in the
+-                // tabbed mode. We want to animate their opacity when going in and out of tabbed
+-                // mode, so we don't want to apply "visible" immediately. However, "visible" is
+-                // also used for input handling, and there we *do* want to apply it immediately.
+-                // So, let's just selectively ignore "visible" here when animating alpha.
+                 let visible = visible || tile.alpha_animation.is_some();
+                 if !visible {
+                     continue;
+                 }
+ 
+                 let xray_pos = xray_pos.offset(tile_pos);
+-                tile.render(ctx.r(), tile_pos, xray_pos, focus_ring, &mut |elem| {
+-                    push(elem.into())
+-                });
++                tile.render_with_pill(
++                    ctx.r(),
++                    tile_pos,
++                    xray_pos,
++                    tile_focus_ring,
++                    pill_alpha,
++                    &mut |elem| push(elem.into()),
++                );
+             }
+         }
+     }
+@@ -3014,9 +3151,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+             return;
+         }
+ 
+-        if self.interactive_resize.is_some() {
++        if self.interactive_resize.is_some() || self.seam_resize.is_some() {
+             return;
+         }
++        self.seam_viewport_anchor = None;
+ 
+         let gesture = ViewGesture {
+             current_view_offset: self.view_offset.current(),
+@@ -3514,6 +3652,479 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+         self.view_offset_gesture_end(None);
+     }
+ 
++    fn active_seam_anchor(&self) -> Option<ViewportAnchor> {
++        let (anchor, ts) = self.seam_viewport_anchor?;
++        let col_idx = match anchor {
++            ViewportAnchor::ColLeft { col_idx, .. } | ViewportAnchor::ColRight { col_idx, .. } => {
++                col_idx
++            }
++        };
++        if col_idx >= self.columns.len() {
++            return None;
++        }
++        if self.seam_resize.is_some()
++            || crate::utils::get_monotonic_time().saturating_sub(ts) <= Duration::from_millis(500)
++        {
++            Some(anchor)
++        } else {
++            None
++        }
++    }
++
++    /// TB520FU: Hit-test top-center pill handles on visible scrolling tiles.
++    pub fn pill_hit_under(&self, pos: Point<f64, Logical>) -> Option<(&W, Point<f64, Logical>)> {
++        if self.columns.is_empty() {
++            return None;
++        }
++        let scale = self.scale;
++        let view_off = Point::from((-self.view_pos(), 0.));
++        for (col, col_x) in self.columns_in_render_order() {
++            let col_off = Point::from((col_x, 0.));
++            let col_render_off = col.render_offset();
++            for (tile, tile_off, visible) in col.tiles_in_render_order() {
++                if !visible || tile.fullscreen_progress() >= 0.05 {
++                    continue;
++                }
++                let tile_pos = (view_off + col_off + col_render_off + tile_off + tile.render_offset())
++                    .to_physical_precise_round(scale)
++                    .to_logical(scale);
++                let win_loc = tile_pos + tile.window_loc();
++                let win_size = tile.animated_window_size();
++                if win_size.w < 96. {
++                    continue;
++                }
++                let cx = win_loc.x + win_size.w * 0.5;
++                let top_y = win_loc.y;
++                if (pos.x - cx).abs() <= 36. && pos.y >= top_y - 11. && pos.y <= top_y + 20. {
++                    return Some((tile.window(), Point::from((cx, top_y))));
++                }
++            }
++        }
++        None
++    }
++
++    /// TB520FU: Hit-test column split seams, outer column edges, and vertical stack row seams.
++    pub fn touch_seam_hit(&self, pos: Point<f64, Logical>) -> Option<ScrollingSeamHit<W::Id>> {
++        if self.columns.is_empty() {
++            return None;
++        }
++        if self.columns[self.active_column_idx]
++            .tiles
++            .iter()
++            .any(|t| t.fullscreen_progress() >= 0.05)
++        {
++            return None;
++        }
++
++        let work = self.working_area;
++        if pos.y < work.loc.y - 6. || pos.y > work.loc.y + work.size.h + 6. {
++            return None;
++        }
++
++        let gaps = self.options.layout.gaps;
++        let full_w = (work.size.w - gaps).max(1.);
++        let view_x = self.view_pos();
++        let scale = self.scale;
++        let is_centering = self.is_centering_focused_column();
++
++        // Collect exact rendered column X bounds `[left_x, right_x]` in workspace view coordinates.
++        // Note: `-view_x` already incorporates `work.loc.x + gaps` (see `ViewOffset` doc comment).
++        let mut col_bounds: Vec<(f64, f64, f64)> = Vec::with_capacity(self.columns.len());
++        for ((col, col_x), col_data) in zip(
++            zip(&self.columns, self.column_xs(self.data.iter().copied())),
++            &self.data,
++        ) {
++            let left_x = col_x - view_x + col.render_offset().x;
++            let right_x = left_x + col_data.width;
++            let prop = ((col_data.width + gaps) / full_w).clamp(0.15, 1.0);
++            col_bounds.push((left_x, right_x, prop));
++        }
++
++        // 1. Horizontal stack seam inside any multi-tile column (`±24px` touch band).
++        for (ci, col) in self.columns.iter().enumerate() {
++            if col.tiles.len() < 2 || col.display_mode == ColumnDisplay::Tabbed {
++                continue;
++            }
++            let (col_l, col_r, _) = col_bounds[ci];
++            if pos.x < col_l + 20. || pos.x > col_r - 20. {
++                continue;
++            }
++            let col_x_raw = self.column_x(ci);
++            let base = Point::from((-view_x + col_x_raw, 0.)) + col.render_offset();
++            let tiles_vec: Vec<_> = col.tiles().collect();
++            for ri in 0..(tiles_vec.len() - 1) {
++                let (upper_tile, upper_off) = tiles_vec[ri];
++                let (lower_tile, lower_off) = tiles_vec[ri + 1];
++                let upper_pos = (base + upper_off + upper_tile.render_offset())
++                    .to_physical_precise_round(scale)
++                    .to_logical(scale);
++                let lower_pos = (base + lower_off + lower_tile.render_offset())
++                    .to_physical_precise_round(scale)
++                    .to_logical(scale);
++                let upper_bottom =
++                    upper_pos.y + upper_tile.window_loc().y + upper_tile.animated_window_size().h;
++                let lower_top = lower_pos.y + lower_tile.window_loc().y;
++                let seam_y = (upper_bottom + lower_top) * 0.5;
++                let dist = (pos.y - seam_y).abs();
++                if dist <= 24. {
++                    return Some(ScrollingSeamHit::RowSeam {
++                        col_idx: ci,
++                        upper_win_id: upper_tile.window().id().clone(),
++                        start_upper_h: upper_tile.window_size().h,
++                        dist_from_seam: dist,
++                    });
++                }
++            }
++        }
++
++        // 2. Vertical seam between adjacent columns `i` and `i + 1` (`±26px` = 52 logical px ≈ 9.7mm).
++        let view_w = self.view_size.w;
++        for ci in 0..(col_bounds.len().saturating_sub(1)) {
++            let (l_left, l_right, l_prop) = col_bounds[ci];
++            let (r_left, r_right, r_prop) = col_bounds[ci + 1];
++            let seam_x = (l_right + r_left) * 0.5;
++            if seam_x < -16. || seam_x > view_w + 16. {
++                continue;
++            }
++            let dist = (pos.x - seam_x).abs();
++            if dist <= 26. {
++                let coupled = l_left >= -64. && r_right <= view_w + 64.;
++                return Some(ScrollingSeamHit::ColSeam {
++                    left_col_idx: ci,
++                    coupled,
++                    left_prop_0: l_prop,
++                    right_prop_0: r_prop,
++                    start_left_x: l_left,
++                    work_w: work.size.w,
++                    gaps,
++                    dist_from_seam: dist,
++                });
++            }
++        }
++
++        // 3. Outer edge of a visible column with free space next to it (e.g. single 50% column).
++        for (ci, &(left_x, right_x, prop)) in col_bounds.iter().enumerate() {
++            let is_last = ci + 1 == col_bounds.len();
++            let dist_r = (pos.x - right_x).abs();
++            if right_x >= 80.
++                && right_x <= view_w - 24.
++                && (is_last || col_bounds[ci + 1].0 > view_w)
++                && dist_r <= 24.
++            {
++                return Some(ScrollingSeamHit::OuterEdge {
++                    col_idx: ci,
++                    is_left_edge: false,
++                    prop_0: prop,
++                    start_left_x: left_x,
++                    start_right_x: right_x,
++                    centered: is_centering,
++                    work_w: work.size.w,
++                    gaps,
++                    dist_from_seam: dist_r,
++                });
++            }
++            let dist_l = (pos.x - left_x).abs();
++            if ci == 0
++                && left_x >= 24.
++                && left_x <= view_w - 80.
++                && dist_l <= 24.
++            {
++                return Some(ScrollingSeamHit::OuterEdge {
++                    col_idx: ci,
++                    is_left_edge: true,
++                    prop_0: prop,
++                    start_left_x: left_x,
++                    start_right_x: right_x,
++                    centered: is_centering,
++                    work_w: work.size.w,
++                    gaps,
++                    dist_from_seam: dist_l,
++                });
++            }
++        }
++
++        None
++    }
++
++    pub fn apply_touch_seam_drag(
++        &mut self,
++        hit: &ScrollingSeamHit<W::Id>,
++        delta: Point<f64, Logical>,
++    ) -> bool {
++        self.view_offset.stop_anim_and_gesture();
++        let now = crate::utils::get_monotonic_time();
++        let scale = self.scale.max(1.);
++
++        match hit {
++            ScrollingSeamHit::ColSeam {
++                left_col_idx,
++                coupled,
++                left_prop_0,
++                right_prop_0,
++                start_left_x,
++                work_w,
++                gaps,
++                ..
++            } => {
++                if *left_col_idx >= self.columns.len() {
++                    return false;
++                }
++                let full = (work_w - gaps).max(1.);
++                let dp = delta.x / full;
++                if *coupled && *left_col_idx + 1 < self.columns.len() {
++                    let sum_p = (*left_prop_0 + *right_prop_0).max(0.40);
++                    let min_p = ((220. + gaps) / full).min(sum_p * 0.42);
++                    let mut p_l = (*left_prop_0 + dp).clamp(min_p, (sum_p - min_p).max(min_p));
++                    let frac = p_l / sum_p;
++                    for det in [1. / 3., 0.5, 2. / 3.] {
++                        if (frac - det).abs() <= 0.018 {
++                            p_l = sum_p * det;
++                            break;
++                        }
++                    }
++                    let p_r = (sum_p - p_l).max(min_p);
++                    let px_pair = (
++                        ((p_l * full - gaps) * scale).round() as i32,
++                        ((p_r * full - gaps) * scale).round() as i32,
++                    );
++                    if self
++                        .seam_resize
++                        .is_some_and(|sr| sr.last_applied_px == px_pair)
++                    {
++                        return false;
++                    }
++
++                    let anchor_x = if sum_p >= 0.92 {
++                        (self.working_area.loc.x + gaps).max(0.)
++                    } else {
++                        start_left_x.max(self.working_area.loc.x + gaps)
++                    };
++                    self.seam_resize = Some(ActiveSeamResize {
++                        cols: [
++                            Some((*left_col_idx, ResizeEdge::RIGHT)),
++                            Some((*left_col_idx + 1, ResizeEdge::LEFT)),
++                        ],
++                        last_applied_px: px_pair,
++                    });
++                    self.seam_viewport_anchor = Some((
++                        ViewportAnchor::ColLeft {
++                            col_idx: *left_col_idx,
++                            screen_x: anchor_x,
++                        },
++                        now,
++                    ));
++
++                    self.columns[*left_col_idx].set_column_width(
++                        SizeChange::SetProportion(p_l * 100.),
++                        None,
++                        false,
++                    );
++                    self.columns[*left_col_idx + 1].set_column_width(
++                        SizeChange::SetProportion(p_r * 100.),
++                        None,
++                        false,
++                    );
++                } else {
++                    let mut p_l = (*left_prop_0 + dp).clamp(0.20, 1.0);
++                    for det in [1. / 3., 0.5, 2. / 3., 1.0] {
++                        if (p_l - det).abs() <= 0.018 {
++                            p_l = det;
++                            break;
++                        }
++                    }
++                    let px_pair = (((p_l * full - gaps) * scale).round() as i32, 0);
++                    if self
++                        .seam_resize
++                        .is_some_and(|sr| sr.last_applied_px == px_pair)
++                    {
++                        return false;
++                    }
++                    self.seam_resize = Some(ActiveSeamResize {
++                        cols: [Some((*left_col_idx, ResizeEdge::RIGHT)), None],
++                        last_applied_px: px_pair,
++                    });
++                    self.seam_viewport_anchor = Some((
++                        ViewportAnchor::ColLeft {
++                            col_idx: *left_col_idx,
++                            screen_x: *start_left_x,
++                        },
++                        now,
++                    ));
++                    self.columns[*left_col_idx].set_column_width(
++                        SizeChange::SetProportion(p_l * 100.),
++                        None,
++                        false,
++                    );
++                }
++                true
++            }
++            ScrollingSeamHit::OuterEdge {
++                col_idx,
++                is_left_edge,
++                prop_0,
++                start_left_x,
++                start_right_x,
++                centered,
++                work_w,
++                gaps,
++                ..
++            } => {
++                if *col_idx >= self.columns.len() {
++                    return false;
++                }
++                let full = (work_w - gaps).max(1.);
++                let sign = if *is_left_edge { -1. } else { 1. };
++                let mult = if *centered { 2. } else { 1. };
++                let mut p = (*prop_0 + sign * mult * delta.x / full).clamp(0.22, 1.0);
++                for det in [1. / 3., 0.5, 2. / 3., 1.0] {
++                    if (p - det).abs() <= 0.018 {
++                        p = det;
++                        break;
++                    }
++                }
++                let px_pair = (((p * full - gaps) * scale).round() as i32, 0);
++                if self
++                    .seam_resize
++                    .is_some_and(|sr| sr.last_applied_px == px_pair)
++                {
++                    return false;
++                }
++                let edge = if *is_left_edge {
++                    ResizeEdge::LEFT
++                } else {
++                    ResizeEdge::RIGHT
++                };
++                self.seam_resize = Some(ActiveSeamResize {
++                    cols: [Some((*col_idx, edge)), None],
++                    last_applied_px: px_pair,
++                });
++                if !*centered {
++                    let anchor = if *is_left_edge {
++                        ViewportAnchor::ColRight {
++                            col_idx: *col_idx,
++                            screen_x: *start_right_x,
++                        }
++                    } else {
++                        ViewportAnchor::ColLeft {
++                            col_idx: *col_idx,
++                            screen_x: *start_left_x,
++                        }
++                    };
++                    self.seam_viewport_anchor = Some((anchor, now));
++                }
++                self.columns[*col_idx].set_column_width(
++                    SizeChange::SetProportion(p * 100.),
++                    None,
++                    false,
++                );
++                true
++            }
++            ScrollingSeamHit::RowSeam {
++                col_idx,
++                upper_win_id,
++                start_upper_h,
++                ..
++            } => {
++                if *col_idx >= self.columns.len() {
++                    return false;
++                }
++                let new_h = (start_upper_h + delta.y).max(110.).round() as i32;
++                let px_pair = (new_h, 0);
++                if self
++                    .seam_resize
++                    .is_some_and(|sr| sr.last_applied_px == px_pair)
++                {
++                    return false;
++                }
++                let col = &mut self.columns[*col_idx];
++                let Some(tile_idx) = col
++                    .tiles
++                    .iter()
++                    .position(|t| t.window().id() == upper_win_id)
++                else {
++                    return false;
++                };
++                self.seam_resize = Some(ActiveSeamResize {
++                    cols: [Some((*col_idx, ResizeEdge::BOTTOM)), None],
++                    last_applied_px: px_pair,
++                });
++                col.set_window_height(SizeChange::SetFixed(new_h), Some(tile_idx), false);
++                true
++            }
++        }
++    }
++
++    pub fn end_touch_seam_drag(&mut self) {
++        if self.seam_resize.take().is_some() {
++            if let Some((anchor, _)) = self.seam_viewport_anchor {
++                self.seam_viewport_anchor = Some((anchor, crate::utils::get_monotonic_time()));
++            }
++        }
++    }
++
++    pub fn apply_touch_seam_double_tap(&mut self, hit: &ScrollingSeamHit<W::Id>) -> bool {
++        let now = crate::utils::get_monotonic_time();
++        self.seam_resize = None;
++        match hit {
++            ScrollingSeamHit::ColSeam {
++                left_col_idx,
++                coupled,
++                gaps,
++                ..
++            } => {
++                if *left_col_idx >= self.columns.len() {
++                    return false;
++                }
++                if *coupled && *left_col_idx + 1 < self.columns.len() {
++                    self.seam_viewport_anchor = Some((
++                        ViewportAnchor::ColLeft {
++                            col_idx: *left_col_idx,
++                            screen_x: (self.working_area.loc.x + gaps).max(0.),
++                        },
++                        now,
++                    ));
++                }
++                self.columns[*left_col_idx].set_column_width(
++                    SizeChange::SetProportion(50.),
++                    None,
++                    true,
++                );
++                if *coupled && *left_col_idx + 1 < self.columns.len() {
++                    self.columns[*left_col_idx + 1].set_column_width(
++                        SizeChange::SetProportion(50.),
++                        None,
++                        true,
++                    );
++                }
++                true
++            }
++            ScrollingSeamHit::OuterEdge { col_idx, prop_0, .. } => {
++                if *col_idx >= self.columns.len() {
++                    return false;
++                }
++                self.seam_viewport_anchor = None;
++                let target = if *prop_0 > 0.85 { 50. } else { 100. };
++                self.columns[*col_idx].set_column_width(
++                    SizeChange::SetProportion(target),
++                    None,
++                    true,
++                );
++                true
++            }
++            ScrollingSeamHit::RowSeam {
++                col_idx,
++                upper_win_id,
++                ..
++            } => {
++                if *col_idx >= self.columns.len() {
++                    return false;
++                }
++                self.reset_window_height(Some(upper_win_id));
++                true
++            }
++        }
++    }
++
+     pub fn interactive_resize_begin(&mut self, window: W::Id, edges: ResizeEdge) -> bool {
+         if self.interactive_resize.is_some() {
+             return false;
+@@ -3636,6 +4247,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+                 if col.contains(&resize.window) {
+                     col_resize_data = Some(resize.data);
+                 }
++            } else if let Some(sr) = &self.seam_resize {
++                for slot in sr.cols.into_iter().flatten() {
++                    if slot.0 == col_idx {
++                        col_resize_data = Some(InteractiveResizeData { edges: slot.1 });
++                        break;
++                    }
++                }
+             }
+ 
+             let is_tabbed = col.display_mode == ColumnDisplay::Tabbed;
+diff --git a/src/layout/tile.rs b/src/layout/tile.rs
+index a157fb85..5a8ba2b4 100644
+--- a/src/layout/tile.rs
++++ b/src/layout/tile.rs
+@@ -676,7 +676,7 @@ impl<W: LayoutElement> Tile<W> {
+         self.sizing_mode
+     }
+ 
+-    fn fullscreen_progress(&self) -> f64 {
++    pub(super) fn fullscreen_progress(&self) -> f64 {
+         if let Some(resize) = &self.resize_animation {
+             if let Some(anim) = &resize.fullscreen_progress {
+                 return anim.clamped_value().clamp(0., 1.);
+@@ -1027,6 +1027,7 @@ impl<W: LayoutElement> Tile<W> {
+         location: Point<f64, Logical>,
+         mut xray_pos: XrayPos,
+         focus_ring: bool,
++        pill_alpha: f32,
+         push: &mut dyn FnMut(TileRenderElement<R>),
+     ) {
+         let _span = tracy_client::span!("Tile::render_inner");
+@@ -1084,6 +1085,52 @@ impl<W: LayoutElement> Tile<W> {
+             &mut |elem| push(elem.into()),
+         );
+ 
++        // TB520FU: subtle top-center frosted pill handle on live Output (omitted from screenshots/screencasts).
++        if pill_alpha > 0.01
++            && ctx.target == RenderTarget::Output
++            && fullscreen_progress < 0.05
++            && BorderRenderElement::has_shader(ctx.renderer)
++            && animated_window_size.w >= 96.
++        {
++            let cx = area.loc.x + area.size.w * 0.5;
++            let ty = area.loc.y + 4.5;
++            let core_size = Size::from((36., 4.5));
++            let halo_size = Size::from((38., 6.5));
++            let core_col = Color::new_unpremul(0.95, 0.97, 1., 1.);
++            let halo_col = Color::new_unpremul(0.08, 0.10, 0.16, 1.);
++            let core = BorderRenderElement::new(
++                core_size,
++                Rectangle::from_size(core_size),
++                GradientInterpolation::default(),
++                core_col,
++                core_col,
++                0.,
++                Rectangle::from_size(core_size),
++                0.,
++                CornerRadius::from(2.25),
++                scale.x as f32,
++                pill_alpha * 0.86 * win_alpha,
++            )
++            .with_location(Point::from((cx - 18., ty)));
++            push(core.into());
++
++            let halo = BorderRenderElement::new(
++                halo_size,
++                Rectangle::from_size(halo_size),
++                GradientInterpolation::default(),
++                halo_col,
++                halo_col,
++                0.,
++                Rectangle::from_size(halo_size),
++                0.,
++                CornerRadius::from(3.25),
++                scale.x as f32,
++                pill_alpha * 0.16 * win_alpha,
++            )
++            .with_location(Point::from((cx - 19., ty - 1.)));
++            push(halo.into());
++        }
++
+         // If we're resizing, try to render a shader, or a fallback.
+         let mut pushed_resize = false;
+         if let Some(resize) = &self.resize_animation {
+@@ -1322,11 +1369,24 @@ impl<W: LayoutElement> Tile<W> {
+     }
+ 
+     pub fn render<R: NiriRenderer>(
++        &self,
++        ctx: RenderCtx<R>,
++        location: Point<f64, Logical>,
++        xray_pos: XrayPos,
++        focus_ring: bool,
++        push: &mut dyn FnMut(TileRenderElement<R>),
++    ) {
++        let pill_alpha = if focus_ring { 0.72 } else { 0.0 };
++        self.render_with_pill(ctx, location, xray_pos, focus_ring, pill_alpha, push);
++    }
++
++    pub fn render_with_pill<R: NiriRenderer>(
+         &self,
+         mut ctx: RenderCtx<R>,
+         location: Point<f64, Logical>,
+         xray_pos: XrayPos,
+         focus_ring: bool,
++        pill_alpha: f32,
+         push: &mut dyn FnMut(TileRenderElement<R>),
+     ) {
+         let _span = tracy_client::span!("Tile::render");
+@@ -1349,6 +1409,7 @@ impl<W: LayoutElement> Tile<W> {
+                 Point::new(0., 0.),
+                 xray_pos,
+                 focus_ring,
++                pill_alpha,
+                 &mut |elem| elements.push(elem),
+             );
+             match open.render(
+@@ -1376,6 +1437,7 @@ impl<W: LayoutElement> Tile<W> {
+                 Point::new(0., 0.),
+                 xray_pos,
+                 focus_ring,
++                pill_alpha,
+                 &mut |elem| elements.push(elem),
+             );
+             match alpha.offscreen.render(ctx.renderer, scale, &elements) {
+@@ -1394,7 +1456,9 @@ impl<W: LayoutElement> Tile<W> {
+         }
+ 
+         if !pushed {
+-            self.render_inner(ctx, location, xray_pos, focus_ring, &mut |elem| push(elem));
++            self.render_inner(ctx, location, xray_pos, focus_ring, pill_alpha, &mut |elem| {
++                push(elem)
++            });
+         }
+     }
+ 
+diff --git a/src/layout/workspace.rs b/src/layout/workspace.rs
+index 74487797..6e2c0176 100644
+--- a/src/layout/workspace.rs
++++ b/src/layout/workspace.rs
+@@ -19,8 +19,24 @@ use smithay::wayland::shell::xdg::SurfaceCachedState;
+ 
+ use super::floating::{FloatingSpace, FloatingSpaceRenderElement};
+ use super::scrolling::{
+-    Column, ColumnWidth, ScrollDirection, ScrollingSpace, ScrollingSpaceRenderElement,
++    Column, ColumnWidth, ScrollDirection, ScrollingSeamHit, ScrollingSpace,
++    ScrollingSpaceRenderElement,
+ };
++
++#[derive(Debug, Clone)]
++pub enum WorkspaceTouchHit<WRef, I> {
++    TopPill {
++        window: WRef,
++        pill_anchor_in_ws: Point<f64, Logical>,
++        is_floating: bool,
++    },
++    FloatingEdge {
++        window: WRef,
++        edges: ResizeEdge,
++        inside_win: bool,
++    },
++    ScrollingSeam(ScrollingSeamHit<I>),
++}
+ use super::shadow::Shadow;
+ use super::tile::{Tile, TileRenderSnapshot};
+ use super::{
+@@ -1633,10 +1649,13 @@ impl<W: LayoutElement> Workspace<W> {
+         push: &mut dyn FnMut(WorkspaceRenderElement<R>),
+     ) {
+         let scrolling_focus_ring = focus_ring && !self.floating_is_active();
+-        self.scrolling
+-            .render(ctx, xray_pos, scrolling_focus_ring, &mut |elem| {
+-                push(elem.into())
+-            });
++        self.scrolling.render_with_pills(
++            ctx,
++            xray_pos,
++            scrolling_focus_ring,
++            focus_ring,
++            &mut |elem| push(elem.into()),
++        );
+     }
+ 
+     pub fn render_floating<R: NiriRenderer>(
+@@ -1652,10 +1671,14 @@ impl<W: LayoutElement> Workspace<W> {
+ 
+         let view_rect = Rectangle::from_size(self.view_size);
+         let floating_focus_ring = focus_ring && self.floating_is_active();
+-        self.floating
+-            .render(ctx, xray_pos, view_rect, floating_focus_ring, &mut |elem| {
+-                push(elem.into())
+-            });
++        self.floating.render_with_pills(
++            ctx,
++            xray_pos,
++            view_rect,
++            floating_focus_ring,
++            focus_ring,
++            &mut |elem| push(elem.into()),
++        );
+     }
+ 
+     pub fn render_shadow<R: NiriRenderer>(
+@@ -1768,6 +1791,119 @@ impl<W: LayoutElement> Workspace<W> {
+         self.scrolling.window_under(pos)
+     }
+ 
++    /// TB520FU: Hit-test top pill handles, floating window border/corner zones, and scrolling seams.
++    pub fn touch_window_hit(
++        &self,
++        pos: Point<f64, Logical>,
++    ) -> Option<WorkspaceTouchHit<&W, W::Id>> {
++        // 1. Visible floating windows in front-to-back z-order.
++        if self.is_floating_visible() {
++            for (tile, tile_pos) in self.floating.tiles_with_render_positions() {
++                if tile.fullscreen_progress() >= 0.05 {
++                    continue;
++                }
++                let win_loc = tile_pos + tile.window_loc();
++                let win_size = tile.animated_window_size();
++                let left = win_loc.x;
++                let right = win_loc.x + win_size.w;
++                let top = win_loc.y;
++                let bottom = win_loc.y + win_size.h;
++
++                // Top-center pill handle (`72 x 31 px`).
++                if win_size.w >= 96. {
++                    let cx = left + win_size.w * 0.5;
++                    if (pos.x - cx).abs() <= 36. && pos.y >= top - 11. && pos.y <= top + 20. {
++                        return Some(WorkspaceTouchHit::TopPill {
++                            window: tile.window(),
++                            pill_anchor_in_ws: Point::from((cx, top)),
++                            is_floating: true,
++                        });
++                    }
++                }
++
++                // Extended border/corner grab zone (`18px` outside, `10px` inside; `26px` corners).
++                const OUTER: f64 = 18.;
++                const INNER: f64 = 10.;
++                const CORNER: f64 = 26.;
++                let in_outer = pos.x >= left - OUTER
++                    && pos.x <= right + OUTER
++                    && pos.y >= top - OUTER
++                    && pos.y <= bottom + OUTER;
++                let in_strict_inner = pos.x > left + INNER
++                    && pos.x < right - INNER
++                    && pos.y > top + INNER
++                    && pos.y < bottom - INNER;
++
++                if in_outer && !in_strict_inner {
++                    let mut edges = ResizeEdge::empty();
++                    let near_v_band = pos.y <= top + CORNER || pos.y >= bottom - CORNER;
++                    let near_h_band = pos.x <= left + CORNER || pos.x >= right - CORNER;
++                    let l_thresh = if near_v_band { CORNER } else { INNER };
++                    let r_thresh = if near_v_band { CORNER } else { INNER };
++                    let t_thresh = if near_h_band { CORNER } else { INNER };
++                    let b_thresh = if near_h_band { CORNER } else { INNER };
++
++                    if pos.x <= left + l_thresh {
++                        edges |= ResizeEdge::LEFT;
++                    } else if pos.x >= right - r_thresh {
++                        edges |= ResizeEdge::RIGHT;
++                    }
++                    if pos.y <= top + t_thresh {
++                        edges |= ResizeEdge::TOP;
++                    } else if pos.y >= bottom - b_thresh {
++                        edges |= ResizeEdge::BOTTOM;
++                    }
++                    if !edges.is_empty() {
++                        let inside_win =
++                            pos.x >= left && pos.x <= right && pos.y >= top && pos.y <= bottom;
++                        return Some(WorkspaceTouchHit::FloatingEdge {
++                            window: tile.window(),
++                            edges,
++                            inside_win,
++                        });
++                    }
++                }
++
++                // Interior of this floating window occludes anything behind it!
++                if in_strict_inner {
++                    return None;
++                }
++            }
++        }
++
++        // 2. Top-center pill handle on visible scrolling tiles.
++        if let Some((win, anchor)) = self.scrolling.pill_hit_under(pos) {
++            return Some(WorkspaceTouchHit::TopPill {
++                window: win,
++                pill_anchor_in_ws: anchor,
++                is_floating: false,
++            });
++        }
++
++        // 3. Scrolling column split seams, outer edges, and vertical stack row seams.
++        if let Some(seam) = self.scrolling.touch_seam_hit(pos) {
++            return Some(WorkspaceTouchHit::ScrollingSeam(seam));
++        }
++
++        None
++    }
++
++    pub fn apply_touch_seam_drag(
++        &mut self,
++        hit: &ScrollingSeamHit<W::Id>,
++        delta: Point<f64, Logical>,
++    ) -> bool {
++        self.scrolling.apply_touch_seam_drag(hit, delta)
++    }
++
++    pub fn end_touch_seam_drag(&mut self) {
++        self.scrolling.end_touch_seam_drag();
++    }
++
++    pub fn apply_touch_seam_double_tap(&mut self, hit: &ScrollingSeamHit<W::Id>) -> bool {
++        self.scrolling.apply_touch_seam_double_tap(hit)
++    }
++
+     pub fn resize_edges_under(&self, pos: Point<f64, Logical>) -> Option<ResizeEdge> {
+         self.tiles_with_render_positions()
+             .find_map(|(tile, tile_pos, visible)| {
+diff --git a/src/niri.rs b/src/niri.rs
+index 79c993b9..b9ac7f41 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -378,6 +378,9 @@ pub struct Niri {
+     pub pointer_inside_hot_corner: bool,
+     pub tablet_cursor_location: Option<Point<f64, Logical>>,
+     pub gesture_swipe_3f_cumulative: Option<(f64, f64)>,
++    pub touchpad_pinch_last_scale: Option<f64>,
++    pub curtain_swipe_active: bool,
++    pub last_seam_tap: Option<(Duration, Point<f64, Logical>)>,
+     pub touch_pinch: crate::input::touch_pinch::TouchPinch,
+     pub touch_gate: crate::input::touch_gate::TouchGateWriter,
+     pub overview_scroll_swipe_gesture: ScrollSwipeGesture,
+@@ -2850,6 +2853,9 @@ impl Niri {
+             pointer_inside_hot_corner: false,
+             tablet_cursor_location: None,
+             gesture_swipe_3f_cumulative: None,
++            touchpad_pinch_last_scale: None,
++            curtain_swipe_active: false,
++            last_seam_tap: None,
+             touch_pinch: Default::default(),
+             touch_gate: Default::default(),
+             overview_scroll_swipe_gesture: ScrollSwipeGesture::new(),
+@@ -3553,6 +3559,12 @@ impl Niri {
+     /// locations to global space according to where they are rendered.
+     ///
+     /// This function does not take pointer or touch grabs into account.
++    pub fn is_tb520fu_curtain_open(&self) -> bool {
++        self.mapped_layer_surfaces
++            .keys()
++            .any(|s| s.namespace() == "tb520fu-curtain")
++    }
++
+     pub fn contents_under(&self, pos: Point<f64, Logical>) -> PointContents {
+         let mut rv = PointContents::default();
+ 
+-- 
+2.47.3
+

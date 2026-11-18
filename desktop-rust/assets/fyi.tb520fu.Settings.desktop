@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=设置
+Name[zh_CN]=设置
+GenericName=系统设置
+Comment=TB520FU 网络、蓝牙、显示、声音、电源与手写笔设置
+Exec=taskset -c 2-7 /usr/local/bin/tb520fu-settings
+Icon=fyi.tb520fu.Settings
+Terminal=false
+StartupWMClass=fyi.tb520fu.Settings
+Categories=Settings;System;
+Keywords=settings;wifi;bluetooth;display;sound;power;stylus;设置;网络;蓝牙;显示;电池;

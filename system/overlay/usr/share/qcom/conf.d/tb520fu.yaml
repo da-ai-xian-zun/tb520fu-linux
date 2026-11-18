@@ -1,0 +1,7 @@
+machines:
+  "Lenovo Yoga Pad Pro 12.7 (TB520FU)":
+    DSP_LIBRARY_PATH: "/sm8650/Lenovo/tb520fu/"
+  "Lenovo Yoga Pad Pro 12.7 / Yoga Tab Plus (TB520FU)":
+    DSP_LIBRARY_PATH: "/sm8650/Lenovo/tb520fu/"
+  "Lenovo Legion Y700 (2025) / TB321FU":
+    DSP_LIBRARY_PATH: "/sm8650/Lenovo/tb520fu/"

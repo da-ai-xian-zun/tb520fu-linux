@@ -1,0 +1,297 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0
+# Early userspace init script for Lenovo Yoga Pad Pro 12.7 (TB520FU) Mainline Linux
+#
+# Safety invariants (per REVIEW-20261108.md Section 1, Section 7 N1-N5 & Btrfs migration):
+#   1. Built into kernel Image via CONFIG_INITRAMFS_SOURCE alongside static
+#      /bin/busybox, static /sbin/dmsetup, and /dev/console (c 5 1).
+#   2. Reopens stdin/stdout/stderr on /dev/console immediately after mounting
+#      devtmpfs (N1) so tty1 fbcon receives all output and shell input works.
+#   3. Reads boot stage from /etc/tb520fu_stage (N4, since CONFIG_CMDLINE_FORCE=y):
+#        - stage1 (nodm)           : Do not touch userdata or dm-linear at all.
+#        - stage2 (ro_verify_only) : Default when dm table is embedded. Maps
+#                                    linux_root read-only, verifies 64 KiB +
+#                                    64 MiB btrfs superblocks & UUID, mounts
+#                                    @main read-only, lists /newroot, then
+#                                    enters timed rescue shell (never rw).
+#        - stage3 (rw_boot)        : Verifies 64 KiB + 64 MiB btrfs superblocks
+#                                    & UUID read-only first, then promotes to
+#                                    rw mount (subvol=@main,compress=zstd:1,noatime)
+#                                    and runs switch_root.
+#   4. Rescue shell waits up to 60s for Enter key before running `reboot -f`
+#      so the tablet never hangs indefinitely without a keyboard attached.
+
+export PATH="/sbin:/bin:/usr/sbin:/usr/bin"
+/bin/busybox --install -s /bin
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+[ -c /dev/console ] || mknod -m 600 /dev/console c 5 1
+exec </dev/console >/dev/console 2>&1
+
+mkdir -p /dev/pts /dev/mapper /newroot /run
+/sbin/dmsetup mknodes
+
+usb_host_connected() {
+    grep -q configured /sys/class/udc/*/state 2>/dev/null
+}
+
+# A shell on the host's /dev/ttyACM0. The USB controller may probe after init
+# starts, so wait for it in the background.
+start_usb_console() {
+    [ -n "$USB_CONSOLE_STARTED" ] && return 0
+    USB_CONSOLE_STARTED=1
+    mount -t configfs none /sys/kernel/config 2>/dev/null || true
+    G=/sys/kernel/config/usb_gadget/tb520fu
+    if [ ! -d /sys/kernel/config/usb_gadget ]; then
+        echo "[tb520fu-initramfs] USB console unavailable: no gadget configfs"
+        return 0
+    fi
+    (
+        UDC=""
+        i=0
+        while [ "$i" -lt 60 ]; do
+            UDC=$(ls /sys/class/udc 2>/dev/null | head -n 1)
+            [ -n "$UDC" ] && break
+            sleep 1
+            i=$((i + 1))
+        done
+        if [ -z "$UDC" ]; then
+            echo "[tb520fu-initramfs] USB console unavailable: no UDC after 60s"
+            exit 0
+        fi
+        mkdir -p "$G/strings/0x409" "$G/configs/c.1/strings/0x409" "$G/functions/acm.usb0"
+        echo 0x1d6b > "$G/idVendor"
+        echo 0x0104 > "$G/idProduct"
+        echo TB520FU0001 > "$G/strings/0x409/serialnumber"
+        echo Lenovo > "$G/strings/0x409/manufacturer"
+        echo "TB520FU initramfs console" > "$G/strings/0x409/product"
+        echo console > "$G/configs/c.1/strings/0x409/configuration"
+        ln -s "$G/functions/acm.usb0" "$G/configs/c.1/"
+        echo "$UDC" > "$G/UDC"
+        echo "[tb520fu-initramfs] USB serial console up on $UDC"
+        while :; do
+            if [ -c /dev/ttyGS0 ]; then
+                setsid sh -c 'exec /bin/sh -i </dev/ttyGS0 >/dev/ttyGS0 2>&1'
+            fi
+            sleep 1
+        done
+    ) &
+}
+
+rescue_shell() {
+    REASON="$1"
+    # stage3 skips the USB console to keep switch_root clean; failing means we want it.
+    start_usb_console
+    echo "[tb520fu-initramfs] ================================================================"
+    echo "[tb520fu-initramfs] Rescue / Verification Shell: ${REASON}"
+    echo "[tb520fu-initramfs] Press ENTER within 60 seconds for interactive /bin/sh,"
+    echo "[tb520fu-initramfs] or wait 60 seconds for automatic reboot (reboot -f)."
+    echo "[tb520fu-initramfs] ================================================================"
+    if read -r -t 60 _; then
+        echo "[tb520fu-initramfs] Entering interactive shell (type 'exit' to reboot)..."
+        /bin/sh -i || true
+    else
+        if usb_host_connected; then
+            echo "[tb520fu-initramfs] USB host connected; staying up. Run 'reboot -f' from the USB shell when done."
+            while usb_host_connected; do sleep 5; done
+            echo "[tb520fu-initramfs] USB host went away; rebooting."
+        else
+            echo "[tb520fu-initramfs] No console input within 60s; rebooting now..."
+        fi
+    fi
+    sync
+    umount /newroot 2>/dev/null || true
+    /sbin/dmsetup remove linux_root 2>/dev/null || true
+    reboot -f
+    while :; do sleep 1; done
+}
+
+find_partdev() {
+    PART_TARGET="$1"
+    for uev in /sys/class/block/sd*/uevent; do
+        [ -f "$uev" ] || continue
+        if grep -qx "PARTNAME=${PART_TARGET}" "$uev" 2>/dev/null; then
+            DEVNAME=$(sed -n 's/^DEVNAME=//p' "$uev")
+            if [ -n "$DEVNAME" ] && [ -b "/dev/${DEVNAME}" ]; then
+                echo "/dev/${DEVNAME}"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+STAGE="stage1"
+if [ -f /etc/tb520fu_stage ]; then
+    STAGE="$(tr -d ' \t\r\n' < /etc/tb520fu_stage)"
+fi
+
+CMDLINE="$(cat /proc/cmdline 2>/dev/null || true)"
+case " $CMDLINE " in
+    *" tb520fu.nodm=1 "*)
+        STAGE="stage1"
+        ;;
+    *" tb520fu.ro_verify_only=1 "*)
+        STAGE="stage2"
+        ;;
+esac
+
+echo "[tb520fu-initramfs] Boot stage: ${STAGE}"
+
+# Not in stage3: the helper would outlive switch_root and pin the old root.
+case "$STAGE" in
+    stage3|3|rw|rw_boot) ;;
+    *) start_usb_console ;;
+esac
+
+case "$STAGE" in
+    stage1|1|nodm)
+        rescue_shell "Stage-1 safe mode (nodm): skipping userdata & dm-linear"
+        ;;
+esac
+
+# --- 2026-11-13: Linux has its own GPT partition (#17, PARTNAME=linux). Boot it first.
+# Target from the partition's btrfs top level: boot-target.once (removed when used) or
+# boot-target; "@<subvol>" = that subvolume (default @daily), "image" = the old dm-linear
+# image path below (its image in userdata is gone since the Android reset; kept only so a
+# GPT without the linux partition still ends in the rescue shell after the UUID check).
+# A failing target is retried as @daily once; after that the rescue shell, never the image.
+try_subvol() {
+    if mount -t btrfs -o "rw,subvol=$1,compress=zstd:1,noatime" "$LP" /newroot; then
+        if [ -x /newroot/sbin/init ] || [ -L /newroot/sbin/init ]; then
+            echo "[tb520fu-initramfs] Switching root to $1 on ${LP}..."
+            umount /proc
+            umount /sys
+            mount --move /dev /newroot/dev
+            exec switch_root /newroot /sbin/init
+        fi
+        echo "[tb520fu-initramfs] $1 has no /sbin/init"
+        umount /newroot
+    else
+        echo "[tb520fu-initramfs] cannot mount subvolume $1"
+    fi
+    return 1
+}
+boot_linux_part() {
+    LP=""; T=0
+    while [ "$T" -lt 25 ]; do
+        LP=$(find_partdev linux || true)
+        [ -n "$LP" ] && [ -b "$LP" ] && break
+        LP=""; sleep 0.2; T=$((T + 1))
+    done
+    [ -n "$LP" ] || { echo "[tb520fu-initramfs] no PARTNAME=linux; trying the old image path"; return 1; }
+    mkdir -p /mnt/top
+    mount -t btrfs -o rw,noatime "$LP" /mnt/top || rescue_shell "cannot mount the linux partition ${LP}"
+    TGT=@daily
+    if [ -s /mnt/top/boot-target.once ]; then
+        TGT=$(tr -d ' \t\r\n' < /mnt/top/boot-target.once); rm -f /mnt/top/boot-target.once; sync
+    elif [ -s /mnt/top/boot-target ]; then
+        TGT=$(tr -d ' \t\r\n' < /mnt/top/boot-target)
+    fi
+    umount /mnt/top
+    echo "[tb520fu-initramfs] linux partition ${LP}, boot target ${TGT}"
+    [ "$TGT" = image ] && return 1
+    try_subvol "$TGT" || true
+    [ "$TGT" = @daily ] || { echo "[tb520fu-initramfs] retrying with @daily"; try_subvol @daily || true; }
+    rescue_shell "could not boot ${TGT} from ${LP}. In the shell: mount ${LP} /mnt/top, fix /mnt/top/boot-target (e.g. @daily), reboot -f; or pick Android in the menu"
+}
+case "$STAGE" in
+    stage3|3|rw|rw_boot) boot_linux_part || true ;;
+esac
+
+if [ ! -f /etc/mainline_dm_table.txt ] || [ ! -s /etc/mainline_dm_table.txt ]; then
+    rescue_shell "No /etc/mainline_dm_table.txt embedded (Stage-1 bringup mode; userdata untouched)"
+fi
+
+if [ ! -f /etc/mainline_root_uuid.txt ] || [ ! -s /etc/mainline_root_uuid.txt ]; then
+    rescue_shell "FATAL: /etc/mainline_root_uuid.txt is missing! Refusing dm-linear."
+fi
+
+EXPECTED_UUID="$(tr -d ' \t\r\n' < /etc/mainline_root_uuid.txt)"
+if [ -z "$EXPECTED_UUID" ]; then
+    rescue_shell "FATAL: /etc/mainline_root_uuid.txt is empty!"
+fi
+
+echo "[tb520fu-initramfs] Waiting for internal UFS 4.0 GPT partition PARTNAME=userdata..."
+TRIES=0
+USERDATA_DEV=""
+while [ "$TRIES" -lt 75 ]; do
+    USERDATA_DEV=$(find_partdev userdata || true)
+    if [ -n "$USERDATA_DEV" ] && [ -b "$USERDATA_DEV" ]; then
+        break
+    fi
+    sleep 0.2
+    TRIES=$((TRIES + 1))
+done
+
+if [ -z "$USERDATA_DEV" ] || [ ! -b "$USERDATA_DEV" ]; then
+    rescue_shell "FATAL: Timed out waiting for PARTNAME=userdata!"
+fi
+
+echo "[tb520fu-initramfs] Found userdata=${USERDATA_DEV}"
+
+if grep -q "@SUPER_DEV@" /etc/mainline_dm_table.txt 2>/dev/null; then
+    rescue_shell "FATAL: @SUPER_DEV@ (--super-tail) is forbidden and unsupported!"
+fi
+
+sed "s|@USERDATA_DEV@|${USERDATA_DEV}|g" /etc/mainline_dm_table.txt > /run/dm_table.resolved
+
+echo "[tb520fu-initramfs] Creating READ-ONLY dm-linear device 'linux_root'..."
+if ! /sbin/dmsetup create -r linux_root /run/dm_table.resolved; then
+    rescue_shell "FATAL: dmsetup create -r linux_root failed!"
+fi
+/sbin/dmsetup mknodes linux_root
+
+echo "[tb520fu-initramfs] Verifying btrfs 64 KiB primary + 64 MiB backup superblocks (_BHRfS_M) & UUID (${EXPECTED_UUID})..."
+if ! /sbin/dmsetup btrfs-uuid /dev/mapper/linux_root "${EXPECTED_UUID}"; then
+    echo "[tb520fu-initramfs] ================================================================"
+    echo "[tb520fu-initramfs] FATAL: btrfs 64 KiB / 64 MiB superblock or UUID check FAILED!"
+    echo "[tb520fu-initramfs] The F2FS pinned file may have been partially moved or deleted."
+    echo "[tb520fu-initramfs] Refusing to mount read-write to protect Android /data!"
+    echo "[tb520fu-initramfs] ================================================================"
+    /sbin/dmsetup remove linux_root 2>/dev/null || true
+    rescue_shell "btrfs superblock/UUID check failed"
+fi
+
+BTRFS_MOUNT_OPTS="subvol=@main,compress=zstd:1,noatime"
+
+case "$STAGE" in
+    stage2|2|ro_verify_only)
+        echo "[tb520fu-initramfs] Stage-2 (ro_verify_only): Mounting @main read-only to /newroot..."
+        if mount -t btrfs -o "ro,${BTRFS_MOUNT_OPTS}" /dev/mapper/linux_root /newroot; then
+            ls -la /newroot
+            rescue_shell "Stage-2 read-only btrfs verification PASSED"
+        else
+            rescue_shell "Stage-2 read-only mount of @main FAILED"
+        fi
+        ;;
+    stage3|3|rw|rw_boot)
+        ;;
+    *)
+        rescue_shell "Unknown stage '${STAGE}' in /etc/tb520fu_stage (expected stage1, stage2, or stage3)"
+        ;;
+esac
+
+echo "[tb520fu-initramfs] Stage-3: Promoting 'linux_root' to read-write..."
+/sbin/dmsetup remove linux_root
+if ! /sbin/dmsetup create linux_root /run/dm_table.resolved; then
+    rescue_shell "FATAL: dmsetup create (rw) linux_root failed!"
+fi
+/sbin/dmsetup mknodes linux_root
+
+echo "[tb520fu-initramfs] Mounting /dev/mapper/linux_root (btrfs -o rw,${BTRFS_MOUNT_OPTS}) to /newroot..."
+if mount -t btrfs -o "rw,${BTRFS_MOUNT_OPTS}" /dev/mapper/linux_root /newroot; then
+    if [ -x /newroot/sbin/init ] || [ -L /newroot/sbin/init ]; then
+        echo "[tb520fu-initramfs] Switching root to Mainline Linux..."
+        umount /proc
+        umount /sys
+        mount --move /dev /newroot/dev
+        exec switch_root /newroot /sbin/init
+    else
+        echo "[tb520fu-initramfs] ERROR: /newroot/sbin/init not found in @main subvolume!"
+    fi
+fi
+
+rescue_shell "Failed to switch_root into /newroot/sbin/init"

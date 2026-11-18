@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: GPL-3.0-only
+import { Theme, Icons, NotifAppRow } from "theme.slint";
+import { SectionTitle, Card, CardGap, Divider, RowIconBadge, SwitchRow, SwitchPill, InlineSegRow, SelectRow, PillButton } from "widgets.slint";
+
+export component NotifPage inherits VerticalLayout {
+    in property <bool> shell-online: true;
+    in property <bool> dnd: false;
+    in property <bool> dnd-fullscreen: true;
+    in property <bool> dnd-schedule-enabled: false;
+    in property <string> dnd-start-label: "23:00";
+    in property <string> dnd-end-label: "07:30";
+    in property <int> banner-timeout-idx: 1;
+    in property <string> lock-notif-label: "显示完整内容";
+    in property <[NotifAppRow]> notif-apps: [];
+    in property <string> pulse-tag: "";
+
+    callback toggle-dnd(bool);
+    callback send-test-notif();
+    callback toggle-dnd-fullscreen(bool);
+    callback toggle-dnd-schedule(bool);
+    callback open-dnd-start-picker();
+    callback open-dnd-end-picker();
+    callback change-banner-timeout(int);
+    callback open-lock-notif-picker();
+    callback toggle-app-notif(string, bool);
+
+    spacing: 0px;
+
+    SectionTitle { text: "专注与勿扰"; first: true; }
+    Card {
+        pulse: root.pulse-tag == "dnd" || root.pulse-tag == "dnd-sched";
+        VerticalLayout {
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 11px;
+                padding-bottom: 11px;
+                spacing: 12px;
+
+                VerticalLayout {
+                    alignment: center;
+                    RowIconBadge { icon: Icons.moon; active: root.dnd; }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: "勿扰模式";
+                        font-size: 14.5px;
+                        font-weight: 600;
+                        color: Theme.ink;
+                    }
+                    Text {
+                        text: root.dnd ? "已开启 · 静音通知横幅" : "关闭";
+                        font-size: 12px;
+                        color: Theme.sub;
+                        wrap: word-wrap;
+                    }
+                }
+
+                HorizontalLayout {
+                    alignment: center;
+                    spacing: 10px;
+                    PillButton {
+                        text: "预览";
+                        clicked => { root.send-test-notif(); }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        SwitchPill {
+                            checked: root.dnd;
+                            enabled: root.shell-online;
+                            toggled(v) => { root.toggle-dnd(v); }
+                        }
+                    }
+                }
+            }
+            Divider {}
+            SwitchRow {
+                has-icon: true;
+                icon: Icons.monitor;
+                title: "全屏应用时自动勿扰";
+                subtitle: "全屏播放视频或演示时静音横幅";
+                checked: root.dnd-fullscreen;
+                enabled: root.shell-online;
+                toggled(v) => { root.toggle-dnd-fullscreen(v); }
+            }
+            Divider {}
+            SwitchRow {
+                has-icon: true;
+                icon: Icons.clock;
+                title: "定时勿扰";
+                checked: root.dnd-schedule-enabled;
+                enabled: root.shell-online;
+                toggled(v) => { root.toggle-dnd-schedule(v); }
+            }
+            if root.dnd-schedule-enabled : VerticalLayout {
+                Divider {}
+                SelectRow {
+                    title: "开始时间";
+                    value-text: root.dnd-start-label;
+                    open-picker => { root.open-dnd-start-picker(); }
+                }
+                Divider {}
+                SelectRow {
+                    title: "结束时间";
+                    value-text: root.dnd-end-label;
+                    open-picker => { root.open-dnd-end-picker(); }
+                }
+            }
+        }
+    }
+
+    SectionTitle { text: "横幅与锁屏"; }
+    Card {
+        pulse: root.pulse-tag == "lock-notif" || root.pulse-tag == "banner";
+        VerticalLayout {
+            InlineSegRow {
+                has-icon: true;
+                icon: Icons.bell;
+                title: "横幅停留时长";
+                labels: ["3 秒", "4.5 秒", "8 秒"];
+                selected: root.banner-timeout-idx;
+                changed(i) => { root.change-banner-timeout(i); }
+            }
+            Divider {}
+            SelectRow {
+                has-icon: true;
+                icon: Icons.lock;
+                title: "锁屏通知显示";
+                value-text: root.lock-notif-label;
+                open-picker => { root.open-lock-notif-picker(); }
+            }
+        }
+    }
+
+    SectionTitle { text: "应用通知"; }
+    Card {
+        pulse: root.pulse-tag == "notif-apps";
+        VerticalLayout {
+            if root.notif-apps.length == 0 : Rectangle {
+                min-height: 54px;
+                Text {
+                    text: "暂无通知记录";
+                    font-size: 13px;
+                    color: Theme.sub;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+            for app[idx] in root.notif-apps : VerticalLayout {
+                if idx > 0 : Divider {}
+                SwitchRow {
+                    has-icon: true;
+                    icon: Icons.bell;
+                    title: app.name;
+                    checked: app.enabled;
+                    enabled: root.shell-online;
+                    toggled(v) => { root.toggle-app-notif(app.name, v); }
+                }
+            }
+        }
+    }
+    CardGap {}
+}

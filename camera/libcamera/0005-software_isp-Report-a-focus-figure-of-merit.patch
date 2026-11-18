@@ -1,0 +1,304 @@
+From c5257ed0e152e1888a414c9dd809baf985819fb1 Mon Sep 17 00:00:00 2001
+From: da-ai-xian-zun <163512031+da-ai-xian-zun@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 04:25:41 -0500
+Subject: [PATCH 5/6] software_isp: Report a focus figure of merit
+
+Accumulate the absolute luminance difference between horizontally adjacent
+statistics samples in the centre half of the image, along with the
+luminance of the same samples, and report their ratio as FocusFoM. The
+normalisation keeps the figure stable when only the exposure changes.
+
+Based on the focus metric by Osilvfe and mzak in iceland-mainline,
+restricted to a centre window and adapted to the softisp IPA.
+---
+ .../internal/software_isp/swisp_stats.h       | 16 +++++
+ .../internal/software_isp/swstats_cpu.h       | 11 ++-
+ src/ipa/softisp/softisp.cpp                   | 18 +++++
+ src/libcamera/software_isp/swstats_cpu.cpp    | 72 ++++++++++++++-----
+ 4 files changed, 98 insertions(+), 19 deletions(-)
+
+diff --git a/include/libcamera/internal/software_isp/swisp_stats.h b/include/libcamera/internal/software_isp/swisp_stats.h
+index 65d826f..44ce25a 100644
+--- a/include/libcamera/internal/software_isp/swisp_stats.h
++++ b/include/libcamera/internal/software_isp/swisp_stats.h
+@@ -44,6 +44,22 @@ struct SwIspStats {
+ 	 * \brief Number of unsaturated pixels accumulated in \a sum_
+ 	 */
+ 	uint64_t numPixels_;
++	/**
++	 * \brief Sum of absolute horizontal luminance differences in the focus
++	 *        window, used to measure focus
++	 */
++	uint64_t focusSum_;
++	/**
++	 * \brief Sum of the luminance samples in the focus window, used to
++	 *        normalise \a focusSum_ against brightness changes
++	 */
++	uint64_t focusLumaSum_;
++	/**
++	 * \brief Whether the line being processed is inside the focus window
++	 *
++	 * Scratch state for the statistics engine, not meaningful to readers.
++	 */
++	bool focusRow_;
+ 	/**
+ 	 * \brief Number of bins in the yHistogram
+ 	 */
+diff --git a/include/libcamera/internal/software_isp/swstats_cpu.h b/include/libcamera/internal/software_isp/swstats_cpu.h
+index 5518709..6857901 100644
+--- a/include/libcamera/internal/software_isp/swstats_cpu.h
++++ b/include/libcamera/internal/software_isp/swstats_cpu.h
+@@ -67,7 +67,9 @@ public:
+ 		    y >= (window_.y + window_.height))
+ 			return;
+ 
+-		(this->*stats0_)(src, stats_[statsBufferIndex]);
++		SwIspStats &stats = stats_[statsBufferIndex];
++		stats.focusRow_ = y >= focusYStart_ && y < focusYEnd_;
++		(this->*stats0_)(src, stats);
+ 	}
+ 
+ 	void processLine2(uint32_t frame, unsigned int y, const uint8_t *src[], unsigned int statsBufferIndex = 0)
+@@ -79,7 +81,9 @@ public:
+ 		    y >= (window_.y + window_.height))
+ 			return;
+ 
+-		(this->*stats2_)(src, stats_[statsBufferIndex]);
++		SwIspStats &stats = stats_[statsBufferIndex];
++		stats.focusRow_ = y >= focusYStart_ && y < focusYEnd_;
++		(this->*stats2_)(src, stats);
+ 	}
+ 
+ 	Signal<uint32_t, uint32_t> statsReady;
+@@ -114,6 +118,9 @@ private:
+ 	unsigned int ySkipMask_;
+ 
+ 	Rectangle window_;
++	/* Lines [focusYStart_, focusYEnd_) of the centre focus window */
++	unsigned int focusYStart_ = 0;
++	unsigned int focusYEnd_ = 0;
+ 
+ 	Size patternSize_;
+ 
+diff --git a/src/ipa/softisp/softisp.cpp b/src/ipa/softisp/softisp.cpp
+index e35f077..991311c 100644
+--- a/src/ipa/softisp/softisp.cpp
++++ b/src/ipa/softisp/softisp.cpp
+@@ -5,7 +5,9 @@
+  * Software ISP Image Processing Algorithm module
+  */
+ 
++#include <algorithm>
+ #include <chrono>
++#include <limits>
+ #include <stdint.h>
+ #include <sys/mman.h>
+ 
+@@ -183,6 +185,9 @@ int IPASoftIsp::init(const IPASettings &settings,
+ 		stats_ = static_cast<SwIspStats *>(mem);
+ 	}
+ 
++	context_.ctrlMap[&controls::FocusFoM] =
++		ControlInfo(0, std::numeric_limits<int32_t>::max(), 0);
++
+ 	ControlInfoMap::Map ctrlMap = context_.ctrlMap;
+ 	*ipaControls = ControlInfoMap(std::move(ctrlMap), controls::controls);
+ 
+@@ -251,6 +256,19 @@ void IPASoftIsp::processStats(const uint32_t frame,
+ 	ControlList metadata(controls::controls);
+ 	for (const auto &algo : algorithms())
+ 		algo->process(context_, frame, frameContext, stats_, metadata);
++
++	/*
++	 * Focus figure of merit: mean absolute luminance gradient over the
++	 * centre of the image relative to its mean luminance, so that an
++	 * exposure change alone does not look like a focus change.
++	 */
++	if (stats_->valid && stats_->focusLumaSum_) {
++		const uint64_t fom = stats_->focusSum_ * 100000 / stats_->focusLumaSum_;
++		metadata.set(controls::FocusFoM,
++			     static_cast<int32_t>(std::min<uint64_t>(
++				     fom, std::numeric_limits<int32_t>::max())));
++	}
++
+ 	metadataReady.emit(frame, metadata);
+ 
+ 	ControlList ctrls(context_.sensorControls);
+diff --git a/src/libcamera/software_isp/swstats_cpu.cpp b/src/libcamera/software_isp/swstats_cpu.cpp
+index 7463381..d03c2f0 100644
+--- a/src/libcamera/software_isp/swstats_cpu.cpp
++++ b/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -179,14 +179,28 @@ static constexpr unsigned int kRedYMul = 77; /* 0.299 * 256 */
+ static constexpr unsigned int kGreenYMul = 150; /* 0.587 * 256 */
+ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 
+-#define SWSTATS_START_LINE_STATS(pixel_t) \
+-	pixel_t r, g, g2, b;              \
+-	uint64_t yVal;                    \
+-                                          \
+-	uint64_t sumR = 0;                \
+-	uint64_t sumG = 0;                \
+-	uint64_t sumB = 0;                \
+-	uint64_t nSamples = 0;
++/*
++ * The focus measure is the sum of absolute luminance differences between
++ * horizontally adjacent samples in the centre half of the image (in both
++ * directions), with the luminance sum of the same samples to normalise it.
++ * \a limit is the end of the x loop, in the units the loop counts in.
++ */
++#define SWSTATS_START_LINE_STATS(pixel_t, limit)          \
++	pixel_t r, g, g2, b;                              \
++	uint64_t yVal;                                    \
++                                                          \
++	uint64_t sumR = 0;                                \
++	uint64_t sumG = 0;                                \
++	uint64_t sumB = 0;                                \
++	uint64_t nSamples = 0;                            \
++                                                          \
++	const bool focusRow = stats.focusRow_;            \
++	const unsigned int focusX0 = (limit) / 4;         \
++	const unsigned int focusX1 = (limit) * 3 / 4;     \
++	uint64_t focusSum = 0;                            \
++	uint64_t focusLumaSum = 0;                        \
++	uint64_t focusPrevY = 0;                          \
++	bool focusHavePrev = false;
+ 
+ #define SWSTATS_ACCUMULATE_LINE_STATS(div)      \
+ 	if (r < kSaturationThreshold * (div) && \
+@@ -201,20 +215,32 @@ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 	yVal = r * kRedYMul;                    \
+ 	yVal += g * kGreenYMul;                 \
+ 	yVal += b * kBlueYMul;                  \
+-	stats.yHistogram[yVal * SwIspStats::kYHistogramSize / (256 * 256 * (div))]++;
++	stats.yHistogram[yVal * SwIspStats::kYHistogramSize / (256 * 256 * (div))]++; \
++                                                \
++	if (focusRow && x >= focusX0 && x < focusX1) { \
++		const uint64_t focusY = yVal / (div);  \
++		if (focusHavePrev)                     \
++			focusSum += focusY > focusPrevY ? focusY - focusPrevY \
++							: focusPrevY - focusY; \
++		focusLumaSum += focusY;                \
++		focusPrevY = focusY;                   \
++		focusHavePrev = true;                  \
++	}
+ 
+ #define SWSTATS_FINISH_LINE_STATS() \
+ 	stats.sum_.r() += sumR;     \
+ 	stats.sum_.g() += sumG;     \
+ 	stats.sum_.b() += sumB;     \
+-	stats.numPixels_ += nSamples;
++	stats.numPixels_ += nSamples;  \
++	stats.focusSum_ += focusSum;   \
++	stats.focusLumaSum_ += focusLumaSum;
+ 
+ void SwStatsCpu::statsBGGR8Line0(const uint8_t *src[], SwIspStats &stats)
+ {
+ 	const uint8_t *src0 = src[1] + window_.x;
+ 	const uint8_t *src1 = src[2] + window_.x;
+ 
+-	SWSTATS_START_LINE_STATS(uint8_t)
++	SWSTATS_START_LINE_STATS(uint8_t, window_.width)
+ 
+ 	if (swapLines_)
+ 		std::swap(src0, src1);
+@@ -239,7 +265,7 @@ void SwStatsCpu::statsBGGR10Line0(const uint8_t *src[], SwIspStats &stats)
+ 	const uint16_t *src0 = (const uint16_t *)src[1] + window_.x;
+ 	const uint16_t *src1 = (const uint16_t *)src[2] + window_.x;
+ 
+-	SWSTATS_START_LINE_STATS(uint16_t)
++	SWSTATS_START_LINE_STATS(uint16_t, window_.width)
+ 
+ 	if (swapLines_)
+ 		std::swap(src0, src1);
+@@ -265,7 +291,7 @@ void SwStatsCpu::statsBGGR12Line0(const uint8_t *src[], SwIspStats &stats)
+ 	const uint16_t *src0 = (const uint16_t *)src[1] + window_.x;
+ 	const uint16_t *src1 = (const uint16_t *)src[2] + window_.x;
+ 
+-	SWSTATS_START_LINE_STATS(uint16_t)
++	SWSTATS_START_LINE_STATS(uint16_t, window_.width)
+ 
+ 	if (swapLines_)
+ 		std::swap(src0, src1);
+@@ -295,7 +321,7 @@ void SwStatsCpu::statsBGGR10PLine0(const uint8_t *src[], SwIspStats &stats)
+ 	if (swapLines_)
+ 		std::swap(src0, src1);
+ 
+-	SWSTATS_START_LINE_STATS(uint8_t)
++	SWSTATS_START_LINE_STATS(uint8_t, widthInBytes)
+ 
+ 	/* x += 5 sample every other 2x2 block */
+ 	for (unsigned int x = 0; x < widthInBytes; x += 5) {
+@@ -321,7 +347,7 @@ void SwStatsCpu::statsGBRG10PLine0(const uint8_t *src[], SwIspStats &stats)
+ 	if (swapLines_)
+ 		std::swap(src0, src1);
+ 
+-	SWSTATS_START_LINE_STATS(uint8_t)
++	SWSTATS_START_LINE_STATS(uint8_t, widthInBytes)
+ 
+ 	/* x += 5 sample every other 2x2 block */
+ 	for (unsigned int x = 0; x < widthInBytes; x += 5) {
+@@ -344,7 +370,7 @@ void SwStatsCpu::statsBGGR12PLine0(const uint8_t *src[], SwIspStats &stats)
+ 	const uint8_t *src1 = src[2] + window_.x * 3 / 2;
+ 	const unsigned int widthInBytes = window_.width * 3 / 2;
+ 
+-	SWSTATS_START_LINE_STATS(uint8_t)
++	SWSTATS_START_LINE_STATS(uint8_t, widthInBytes)
+ 
+ 	if (swapLines_)
+ 		std::swap(src0, src1);
+@@ -370,7 +396,7 @@ void SwStatsCpu::statsGBRG12PLine0(const uint8_t *src[], SwIspStats &stats)
+ 	const uint8_t *src1 = src[2] + window_.x * 3 / 2;
+ 	const unsigned int widthInBytes = window_.width * 3 / 2;
+ 
+-	SWSTATS_START_LINE_STATS(uint8_t)
++	SWSTATS_START_LINE_STATS(uint8_t, widthInBytes)
+ 
+ 	if (swapLines_)
+ 		std::swap(src0, src1);
+@@ -407,6 +433,8 @@ void SwStatsCpu::startFrame(uint32_t frame)
+ 	for (auto &s : stats_) {
+ 		s.sum_ = RGB<uint64_t>({ 0, 0, 0 });
+ 		s.numPixels_ = 0;
++		s.focusSum_ = 0;
++		s.focusLumaSum_ = 0;
+ 		s.yHistogram.fill(0);
+ 	}
+ }
+@@ -425,10 +453,14 @@ void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId)
+ 	if (valid) {
+ 		sharedStats_->sum_ = RGB<uint64_t>({ 0, 0, 0 });
+ 		sharedStats_->numPixels_ = 0;
++		sharedStats_->focusSum_ = 0;
++		sharedStats_->focusLumaSum_ = 0;
+ 		sharedStats_->yHistogram.fill(0);
+ 		for (const auto &s : stats_) {
+ 			sharedStats_->sum_ += s.sum_;
+ 			sharedStats_->numPixels_ += s.numPixels_;
++			sharedStats_->focusSum_ += s.focusSum_;
++			sharedStats_->focusLumaSum_ += s.focusLumaSum_;
+ 			for (unsigned int j = 0; j < SwIspStats::kYHistogramSize; j++)
+ 				sharedStats_->yHistogram[j] += s.yHistogram[j];
+ 		}
+@@ -588,6 +620,10 @@ void SwStatsCpu::setWindow(const Rectangle &window)
+ 	window_.width = (window_.width > xShift_ ? window_.width - xShift_ : 0);
+ 	window_.width &= ~(patternSize_.width - 1);
+ 	window_.height &= ~(patternSize_.height - 1);
++
++	/* The focus measure uses the centre half of the window. */
++	focusYStart_ = window_.y + window_.height / 4;
++	focusYEnd_ = window_.y + window_.height * 3 / 4;
+ }
+ 
+ void SwStatsCpu::processBayerFrame2(MappedFrameBuffer &in)
+@@ -607,6 +643,8 @@ void SwStatsCpu::processBayerFrame2(MappedFrameBuffer &in)
+ 		/* linePointers[0] is not used by any stats0_ functions */
+ 		linePointers[1] = src;
+ 		linePointers[2] = src + stride_;
++		stats_[0].focusRow_ = window_.y + y >= focusYStart_ &&
++				      window_.y + y < focusYEnd_;
+ 		(this->*stats0_)(linePointers, stats_[0]);
+ 		src += stride_ * 2;
+ 	}
+-- 
+2.47.3
+

@@ -1,0 +1,12 @@
+// Allow active local users in the `sudo` group to manage timezone, NTP,
+// locale, and static hostname from `tb520fu-settings` without a polkit agent.
+polkit.addRule(function(action, subject) {
+    if ((action.id.indexOf("org.freedesktop.timedate1.") === 0 ||
+         action.id.indexOf("org.freedesktop.locale1.") === 0 ||
+         action.id === "org.freedesktop.hostname1.set-static-hostname" ||
+         action.id === "org.freedesktop.hostname1.set-Pretty-hostname" ||
+         action.id === "org.freedesktop.hostname1.set-hostname") &&
+        subject.active && subject.local && subject.isInGroup("sudo")) {
+        return polkit.Result.YES;
+    }
+});

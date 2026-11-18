@@ -1,0 +1,16 @@
+# Separate from the shell: systemd would open TTYPath for every command of a
+# service, and /dev/ttyGS0 does not exist until this has run.
+[Unit]
+Description=TB520FU USB ACM gadget (bring-up)
+DefaultDependencies=no
+Wants=sys-kernel-config.mount
+After=sys-kernel-config.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/tb520fu-usb-gadget
+TimeoutStartSec=120
+
+[Install]
+WantedBy=sysinit.target

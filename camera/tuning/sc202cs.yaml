@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: CC0-1.0
+# TB520FU macro camera (SmartSens SC202CS, fixed focus), libcamera softisp >= 0.8.
+# CCMs: parsed from the Android tuning file for the macro module.
+# White-balance bias folded into the CCMs: R x1.08, B x0.93 (the softisp grey-world
+# AWB has no bias knob; CCM x diag(r, 1, b) is equivalent).
+# Calibrated 2026-11-18 on the keyboard in a stock Android macro shot: grey Alt key
+# R/G 0.962 B/G 1.061 (Android 0.949/1.039). Black level 3712 left the shadows grey;
+# 4096 (64 at 10 bit) kept.
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+      blackLevel: 4096
+  - Awb:
+  - Ccm:
+      ccms:
+        - ct: 3000
+          ccm: [ 2.2508, -1.3328, 0.2313,
+                 -0.3452, 1.316, 0.0033,
+                 -0.3268, -1.1454, 2.2766 ]
+        - ct: 4000
+          ccm: [ 2.0546, -0.9347, 0.03,
+                 -0.3024, 1.33, -0.0465,
+                 -0.1646, -0.8668, 1.8779 ]
+        - ct: 5000
+          ccm: [ 1.8386, -0.8347, 0.123,
+                 -0.3224, 1.2728, 0.0238,
+                 -0.1646, -0.8668, 1.8779 ]
+        - ct: 6500
+          ccm: [ 1.7961, -0.627, -0.0336,
+                 -0.5284, 1.342, 0.137,
+                 -0.309, -0.682, 1.8303 ]
+  - Adjust:
+      gamma: 2.2
+      contrast: 1.2
+      saturation: 1.15
+  - Agc:
+      # Upper bound only: libipa's default lower bound (top 2 % >= 0.5) drove the
+      # gain to 8x and overexposed every indoor scene on this softisp pipeline.
+      AeConstraintMode:
+        Normal:
+          upper:
+            qLo: 0.98
+            qHi: 1.0
+            yTarget: 0.8
+      relativeLuminanceTarget: 0.25
+...

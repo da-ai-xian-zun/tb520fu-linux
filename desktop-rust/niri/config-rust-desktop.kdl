@@ -1,0 +1,184 @@
+// TB520FU Pure-Rust Vulkan Desktop Suite — Niri Configuration (`~/.config/niri/config.kdl`)
+// Native 2944x1840 @ 120Hz/144Hz, scale 2.0 (1472x920 native 2x integer HiDPI).
+
+output "DSI-1" {
+    scale 2.0
+    transform "normal"
+    // Panel EDR: HDR via backlight + KTZ8866 HBM headroom (~900 cd/m2 peak); see
+    // tb520fu-bootmenu hdr-144-port/niri-panel-edr. Needs the TB520FU niri HDR build.
+    hdr {
+        panel-peak-luminance 900
+    }
+}
+
+// Mi 27" 4K 160Hz on USB-C DP: 4K@144 needs DP DSC + quad pipe (kernel mdss39+).
+output "PNP(XMI) Mi Monitor Unknown" {
+    mode "3840x2160@143.955"
+}
+
+prefer-no-csd
+
+blur {
+    passes 4
+    offset 3.5
+    noise 0.015
+    saturation 1.35
+}
+
+overview {
+    zoom 0.54
+    backdrop-color "#0b1120"
+}
+
+input {
+    touch {
+        map-to-output "DSI-1"
+    }
+    tablet {
+        map-to-output "DSI-1"
+    }
+    keyboard {
+        xkb {
+        }
+        numlock
+    }
+    touchpad {
+        tap
+        dwt
+        dwtp
+        drag true
+        natural-scroll
+        click-method "button-areas"
+    }
+}
+
+gestures {
+    hot-corners {
+        off
+    }
+}
+
+environment {
+    XMODIFIERS "@im=fcitx"
+    QT_IM_MODULE "fcitx"
+    SDL_IM_MODULE "fcitx"
+}
+
+layout {
+    gaps 12
+    center-focused-column "never"
+
+    preset-column-widths {
+        proportion 0.33333
+        proportion 0.5
+        proportion 0.66667
+        proportion 1.0
+    }
+
+    default-column-width { proportion 0.5; }
+
+    focus-ring {
+        width 2
+        active-color "#3b82f6"
+        inactive-color "#ffffff1a"
+    }
+
+    shadow {
+        on
+        softness 24
+        spread 4
+        offset x=0 y=4
+        color "#00000066"
+    }
+}
+
+// Live compositor Dual-Kawase blur for TB520FU Liquid Glass layer surfaces (`tb520fu-bar`,
+// `tb520fu-curtain`, `tb520fu-osk`, `tb520fu-tools`, `tb520fu-osd`) is driven per-frame via
+// `ext-background-effect-v1` `set_blur_region` subregions.
+// Do NOT add `layer-rule { background-effect { blur true / xray true } }`: in Niri, setting
+// `blur true` or `xray true` in `layer-rule` forces a full-screen effect across the entire layer
+// geometry whenever `blur_region` is unset (causing full-screen blur flashes or hiding windows
+// behind transparent overlay layers like `tb520fu-tools`). Niri automatically enables xray blur
+// strictly inside non-empty `ext-background-effect-v1` subregions with zero `layer-rule`.
+
+// Start fcitx5 IM daemon; tb520fu-shell and tb520fu-osk run via systemd user units
+// (with fallback spawn-sh-at-startup in case niri is launched outside systemd-user).
+spawn-at-startup "fcitx5" "-d" "--replace"
+spawn-sh-at-startup "printenv MANAGERPID >/dev/null 2>&1 && test -f /etc/systemd/user/tb520fu-shell.service || exec /usr/local/bin/tb520fu-shell"
+spawn-sh-at-startup "printenv MANAGERPID >/dev/null 2>&1 && test -f /etc/systemd/user/tb520fu-osk.service || exec /usr/local/bin/tb520fu-osk"
+
+hotkey-overlay {
+    skip-at-startup
+}
+
+screenshot-path "~/Pictures/Screenshots/Screenshot-%Y-%m-%d_%H-%M-%S.png"
+
+window-rule {
+    geometry-corner-radius 8
+    clip-to-geometry true
+}
+
+binds {
+    Mod+Shift+Slash { show-hotkey-overlay; }
+
+    Mod+T       hotkey-overlay-title="打开终端 (foot)"         { spawn "foot"; }
+    Mod+Return  hotkey-overlay-title="打开终端 (foot)"         { spawn "foot"; }
+    Mod+O       repeat=false hotkey-overlay-title="切换总览"   { toggle-overview; }
+    Mod+D       hotkey-overlay-title="打开三列控制台与应用菜单" { spawn "tb520fu-shell" "console"; }
+    Mod+A       hotkey-overlay-title="打开控制中心"            { spawn "tb520fu-shell" "control-center"; }
+    Mod+N       hotkey-overlay-title="打开通知中心"            { spawn "tb520fu-shell" "notifications"; }
+    Mod+Shift+S hotkey-overlay-title="截屏手写批注"            { spawn "tb520fu-shell" "annot"; }
+    Mod+Shift+N hotkey-overlay-title="快速便签"                { spawn "tb520fu-shell" "quicknote"; }
+    Mod+K       hotkey-overlay-title="切换屏幕键盘"            { spawn "tb520fu-osk" "toggle"; }
+    Mod+I       hotkey-overlay-title="打开系统设置"            { spawn "tb520fu-settings"; }
+    Mod+Comma   hotkey-overlay-title="打开系统设置"            { spawn "tb520fu-settings"; }
+    Super+L         hotkey-overlay-title="锁定屏幕"            { spawn "tb520fu-shell" "lock"; }
+    Super+Alt+L     hotkey-overlay-title="锁定屏幕"            { spawn "tb520fu-shell" "lock"; }
+    XF86ScreenSaver hotkey-overlay-title="键盘锁屏键"          { spawn "tb520fu-shell" "lock"; }
+
+    // Hardware volume & mute keys (<1ms Unix socket -> TopBar Status Capsule OSD + Pogo LED sync)
+    XF86AudioRaiseVolume allow-when-locked=true { spawn "tb520fu-shell" "vol" "+5"; }
+    XF86AudioLowerVolume allow-when-locked=true { spawn "tb520fu-shell" "vol" "-5"; }
+    XF86AudioMute        allow-when-locked=true { spawn "tb520fu-shell" "mute"; }
+    XF86AudioMicMute     allow-when-locked=true { spawn "tb520fu-shell" "mic-mute"; }
+
+    XF86AudioPlay        allow-when-locked=true { spawn "playerctl" "play-pause"; }
+    XF86AudioStop        allow-when-locked=true { spawn "playerctl" "stop"; }
+    XF86AudioPrev        allow-when-locked=true { spawn "playerctl" "previous"; }
+    XF86AudioNext        allow-when-locked=true { spawn "playerctl" "next"; }
+
+    // Hardware brightness keys (<1ms Unix socket -> TopBar Status Capsule OSD + ALS curve learning)
+    XF86MonBrightnessUp   allow-when-locked=true { spawn "tb520fu-shell" "bri" "+6"; }
+    XF86MonBrightnessDown allow-when-locked=true { spawn "tb520fu-shell" "bri" "-6"; }
+
+    Mod+Q repeat=false { close-window; }
+    Mod+F              { maximize-column; }
+    Mod+Shift+F        { fullscreen-window; }
+    Mod+R              { switch-preset-column-width; }
+    Mod+C              { center-column; }
+    Mod+V              { toggle-window-floating; }
+    Mod+BracketLeft    { consume-or-expel-window-left; }
+    Mod+BracketRight   { consume-or-expel-window-right; }
+
+    Mod+Left  { focus-column-left; }
+    Mod+Right { focus-column-right; }
+    Mod+Down  { focus-window-or-workspace-down; }
+    Mod+Up    { focus-window-or-workspace-up; }
+
+    Mod+Ctrl+Left  { move-column-left; }
+    Mod+Ctrl+Right { move-column-right; }
+    Mod+Ctrl+Down  { move-window-to-workspace-down; }
+    Mod+Ctrl+Up    { move-window-to-workspace-up; }
+
+    Mod+1 { focus-workspace 1; }
+    Mod+2 { focus-workspace 2; }
+    Mod+3 { focus-workspace 3; }
+    Mod+4 { focus-workspace 4; }
+    Mod+5 { focus-workspace 5; }
+
+    Print      { screenshot; }
+    Ctrl+Print { screenshot-screen; }
+    Alt+Print  { screenshot-window; }
+
+    Mod+Shift+E { quit; }
+}

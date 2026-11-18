@@ -1,0 +1,573 @@
+From 468896595d876bfc5261497bb64dd8d21c091484 Mon Sep 17 00:00:00 2001
+From: da-ai-xian-zun <163512031+da-ai-xian-zun@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 04:27:09 -0500
+Subject: [PATCH 6/6] pipeline: simple: Add contrast-detect autofocus
+
+Drive the focus lens from the soft ISP FocusFoM: a coarse scan over the
+whole range, a finer scan around the best coarse position, then a move
+to the sharpest position. Measurements only use frames exposed after the
+lens settled. Continuous mode, the default as PipeWire and GStreamer
+clients don't set AfMode, rescans when the figure of merit stays well
+below its value at lock. Auto mode scans on AfTriggerStart and manual
+mode keeps FocusAbsolute.
+
+The scan strategy follows the TB520FU user-space autofocus daemon, the
+control handling the contrast-detect autofocus by Osilvfe and mzak in
+iceland-mainline.
+---
+ src/libcamera/pipeline/simple/autofocus.cpp | 316 ++++++++++++++++++++
+ src/libcamera/pipeline/simple/autofocus.h   |  70 +++++
+ src/libcamera/pipeline/simple/meson.build   |   1 +
+ src/libcamera/pipeline/simple/simple.cpp    |  67 ++---
+ 4 files changed, 414 insertions(+), 40 deletions(-)
+ create mode 100644 src/libcamera/pipeline/simple/autofocus.cpp
+ create mode 100644 src/libcamera/pipeline/simple/autofocus.h
+
+diff --git a/src/libcamera/pipeline/simple/autofocus.cpp b/src/libcamera/pipeline/simple/autofocus.cpp
+new file mode 100644
+index 0000000..65c4d1f
+--- /dev/null
++++ b/src/libcamera/pipeline/simple/autofocus.cpp
+@@ -0,0 +1,316 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Contrast-detect autofocus for the simple pipeline handler
++ */
++
++#include "autofocus.h"
++
++#include <algorithm>
++#include <cstdlib>
++#include <limits>
++
++#include <libcamera/base/log.h>
++
++#include <libcamera/control_ids.h>
++
++#include "libcamera/internal/camera_lens.h"
++
++/**
++ * \file autofocus.h
++ * \brief Contrast-detect autofocus for cameras with a VCM and a soft ISP
++ *
++ * The soft ISP reports a focus figure of merit (FocusFoM) on the frames it
++ * gathers statistics for. A scan steps the lens through a coarse grid over
++ * the whole range, then refines around the best coarse position, and moves
++ * to the sharpest position found. Each measurement uses a frame exposed
++ * after the lens has settled. In continuous mode the figure of merit is
++ * then watched, and a new scan starts after a scene change.
++ *
++ * Without phase detection a scan has to visit positions on both sides of
++ * the peak; a full coarse grid avoids locking onto a local maximum on the
++ * flat plateau that some scenes show at the far end of the range.
++ */
++
++namespace libcamera {
++
++LOG_DECLARE_CATEGORY(SimplePipeline)
++
++namespace {
++
++/* Number of evenly spaced positions in the coarse scan. */
++constexpr unsigned int kCoarsePoints = 9;
++
++/*
++ * Frames to skip after moving the lens before a figure of merit is used.
++ * Statistics are only gathered on one frame out of four; on the TB520FU
++ * (DW9768) the next statistics frame after a move already shows the new
++ * position, so this selects it.
++ */
++constexpr uint32_t kSettleFrames = 3;
++
++/* Statistics frames to let exposure settle before the first scan. */
++constexpr unsigned int kWarmupStats = 3;
++
++/*
++ * Continuous mode. The figure of merit depends on the scene as much as on
++ * focus, so a fixed drop threshold misses scene changes (a textured scene
++ * out of focus can score like a plain one in focus). Instead, a swing of
++ * more than kDisturbPercent from the reference marks a disturbance (the
++ * camera or the subject moving); once kStableCount consecutive values
++ * agree within kStablePercent, the camera rescans if the figure of merit
++ * settled more than kSettledPercent away from the reference.
++ */
++constexpr int64_t kDisturbPercent = 15;
++constexpr int64_t kStablePercent = 6;
++constexpr unsigned int kStableCount = 2;
++constexpr int64_t kSettledPercent = 6;
++
++bool differs(int32_t value, int32_t reference, int64_t percent)
++{
++	return std::abs(static_cast<int64_t>(value) - reference) * 100 >
++	       static_cast<int64_t>(reference) * percent;
++}
++
++} /* namespace */
++
++SimpleAutoFocus::SimpleAutoFocus(CameraLens *lens, const ControlInfo &range)
++	: lens_(lens), min_(range.min().get<int32_t>()),
++	  max_(range.max().get<int32_t>()), position_(range.def().get<int32_t>()),
++	  mode_(controls::AfModeContinuous), state_(controls::AfStateIdle),
++	  phase_(Phase::Idle), lastFrame_(0), moveFrame_(0), warmup_(0),
++	  target_(0), bestPosition_(position_), bestFoM_(0), lockedFoM_(0),
++	  lastFoM_(0), lowCount_(0), disturbed_(false)
++{
++}
++
++void SimpleAutoFocus::addControls(ControlInfoMap::Map &controls) const
++{
++	/*
++	 * Continuous is the default: applications using the camera through
++	 * PipeWire or GStreamer generally never set AfMode.
++	 */
++	const std::vector<ControlValue> modes = {
++		ControlValue(controls::AfModeManual),
++		ControlValue(controls::AfModeAuto),
++		ControlValue(controls::AfModeContinuous),
++	};
++	controls[&controls::AfMode] =
++		ControlInfo(modes, ControlValue(controls::AfModeContinuous));
++	controls[&controls::AfTrigger] =
++		ControlInfo(controls::AfTriggerValues,
++			    ControlValue(controls::AfTriggerStart));
++	controls[&controls::draft::FocusAbsolute] =
++		ControlInfo(min_, max_, position_);
++}
++
++int SimpleAutoFocus::moveTo(int32_t position)
++{
++	position = std::clamp(position, min_, max_);
++	int ret = lens_->setFocusPosition(position);
++	if (ret < 0) {
++		LOG(SimplePipeline, Error)
++			<< "Failed to move the focus lens to " << position;
++		return ret;
++	}
++
++	position_ = position;
++	moveFrame_ = lastFrame_;
++	return 0;
++}
++
++int SimpleAutoFocus::start()
++{
++	lastFrame_ = 0;
++	moveFrame_ = 0;
++	lowCount_ = 0;
++
++	/* Powers the actuator up and restores the position it lost. */
++	int ret = moveTo(position_);
++
++	if (mode_ == controls::AfModeContinuous) {
++		phase_ = Phase::Warmup;
++		warmup_ = 0;
++		state_ = controls::AfStateScanning;
++	} else {
++		phase_ = Phase::Idle;
++		state_ = controls::AfStateIdle;
++	}
++
++	return ret;
++}
++
++void SimpleAutoFocus::stop()
++{
++	phase_ = Phase::Idle;
++	lens_->close();
++}
++
++void SimpleAutoFocus::startScan()
++{
++	targets_.clear();
++	for (unsigned int i = 0; i < kCoarsePoints; i++)
++		targets_.push_back(min_ + static_cast<int32_t>(
++			static_cast<int64_t>(max_ - min_) * i / (kCoarsePoints - 1)));
++
++	target_ = 0;
++	bestFoM_ = -1;
++	bestPosition_ = position_;
++	lowCount_ = 0;
++	phase_ = Phase::Coarse;
++	state_ = controls::AfStateScanning;
++	moveTo(targets_[0]);
++}
++
++void SimpleAutoFocus::nextTarget()
++{
++	target_++;
++	if (target_ < targets_.size()) {
++		moveTo(targets_[target_]);
++		return;
++	}
++
++	if (phase_ == Phase::Coarse) {
++		/* Refine around the coarse peak, skipping the measured point. */
++		const int32_t step = (max_ - min_) / static_cast<int32_t>(kCoarsePoints - 1);
++		const int32_t centre = bestPosition_;
++		targets_.clear();
++		for (int32_t offset : { -3, -2, -1, 1, 2, 3 }) {
++			int32_t position = centre + offset * step / 4;
++			if (position >= min_ && position <= max_)
++				targets_.push_back(position);
++		}
++
++		phase_ = Phase::Fine;
++		target_ = 0;
++		if (!targets_.empty()) {
++			moveTo(targets_[0]);
++			return;
++		}
++	}
++
++	finishScan();
++}
++
++void SimpleAutoFocus::finishScan()
++{
++	LOG(SimplePipeline, Debug)
++		<< "Autofocus peak at " << bestPosition_ << ", FoM " << bestFoM_;
++
++	moveTo(bestPosition_);
++	phase_ = Phase::Verify;
++}
++
++void SimpleAutoFocus::process(uint32_t frame, const ControlList &metadata)
++{
++	lastFrame_ = std::max(lastFrame_, frame);
++
++	const auto fom = metadata.get(controls::FocusFoM);
++	if (!fom || phase_ == Phase::Idle)
++		return;
++
++	if (frame < moveFrame_ + kSettleFrames)
++		return;
++
++	switch (phase_) {
++	case Phase::Idle:
++		break;
++
++	case Phase::Warmup:
++		if (++warmup_ >= kWarmupStats)
++			startScan();
++		break;
++
++	case Phase::Coarse:
++	case Phase::Fine:
++		if (*fom > bestFoM_) {
++			bestFoM_ = *fom;
++			bestPosition_ = position_;
++		}
++		nextTarget();
++		break;
++
++	case Phase::Verify:
++		/* Reference for continuous mode, measured at the final position. */
++		lockedFoM_ = *fom;
++		lowCount_ = 0;
++		disturbed_ = false;
++		state_ = bestFoM_ > 0 ? controls::AfStateFocused
++				      : controls::AfStateFailed;
++		phase_ = mode_ == controls::AfModeContinuous ? Phase::Locked
++							     : Phase::Idle;
++		LOG(SimplePipeline, Debug)
++			<< "Autofocus locked at " << position_ << ", FoM " << *fom;
++		break;
++
++	case Phase::Locked:
++		if (!disturbed_) {
++			if (differs(*fom, lockedFoM_, kDisturbPercent)) {
++				disturbed_ = true;
++				lowCount_ = 0;
++			} else {
++				/* Track slow drift, e.g. lighting changes. */
++				lockedFoM_ = (lockedFoM_ * 7 + *fom) / 8;
++			}
++			lastFoM_ = *fom;
++			break;
++		}
++
++		if (differs(*fom, lastFoM_, kStablePercent))
++			lowCount_ = 0;
++		else
++			lowCount_++;
++		lastFoM_ = *fom;
++
++		if (lowCount_ >= kStableCount) {
++			disturbed_ = false;
++			if (differs(*fom, lockedFoM_, kSettledPercent)) {
++				LOG(SimplePipeline, Debug)
++					<< "Scene changed (FoM " << lockedFoM_
++					<< " -> " << *fom << "), refocusing";
++				startScan();
++			} else {
++				lockedFoM_ = *fom;
++			}
++		}
++		break;
++	}
++}
++
++int SimpleAutoFocus::queueRequest(const ControlList &controls)
++{
++	const auto mode = controls.get(controls::AfMode);
++	if (mode && *mode != mode_) {
++		mode_ = *mode;
++		if (mode_ == controls::AfModeContinuous) {
++			startScan();
++		} else {
++			phase_ = Phase::Idle;
++			state_ = controls::AfStateIdle;
++		}
++	}
++
++	const auto trigger = controls.get(controls::AfTrigger);
++	if (trigger && mode_ == controls::AfModeAuto) {
++		if (*trigger == controls::AfTriggerStart)
++			startScan();
++		else if (*trigger == controls::AfTriggerCancel) {
++			phase_ = Phase::Idle;
++			state_ = controls::AfStateIdle;
++		}
++	}
++
++	const auto position = controls.get(controls::draft::FocusAbsolute);
++	if (position && mode_ == controls::AfModeManual)
++		return moveTo(*position);
++
++	return 0;
++}
++
++void SimpleAutoFocus::fillMetadata(ControlList &metadata) const
++{
++	metadata.set(controls::AfMode, mode_);
++	metadata.set(controls::AfState, state_);
++	metadata.set(controls::draft::FocusAbsolute, position_);
++}
++
++} /* namespace libcamera */
+diff --git a/src/libcamera/pipeline/simple/autofocus.h b/src/libcamera/pipeline/simple/autofocus.h
+new file mode 100644
+index 0000000..718460b
+--- /dev/null
++++ b/src/libcamera/pipeline/simple/autofocus.h
+@@ -0,0 +1,70 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Contrast-detect autofocus for the simple pipeline handler
++ */
++
++#pragma once
++
++#include <stdint.h>
++#include <vector>
++
++#include <libcamera/controls.h>
++
++namespace libcamera {
++
++class CameraLens;
++
++class SimpleAutoFocus
++{
++public:
++	SimpleAutoFocus(CameraLens *lens, const ControlInfo &range);
++
++	void addControls(ControlInfoMap::Map &controls) const;
++
++	int start();
++	void stop();
++
++	int queueRequest(const ControlList &controls);
++	void process(uint32_t frame, const ControlList &metadata);
++	void fillMetadata(ControlList &metadata) const;
++
++private:
++	enum class Phase {
++		Idle,
++		Warmup,
++		Coarse,
++		Fine,
++		Verify,
++		Locked,
++	};
++
++	int moveTo(int32_t position);
++	void startScan();
++	void nextTarget();
++	void finishScan();
++
++	CameraLens *lens_;
++	int32_t min_;
++	int32_t max_;
++	int32_t position_;
++
++	int32_t mode_;
++	int32_t state_;
++	Phase phase_;
++
++	/* Frame number of the newest metadata when the lens last moved. */
++	uint32_t lastFrame_;
++	uint32_t moveFrame_;
++	unsigned int warmup_;
++
++	std::vector<int32_t> targets_;
++	size_t target_;
++	int32_t bestPosition_;
++	int32_t bestFoM_;
++	int32_t lockedFoM_;
++	int32_t lastFoM_;
++	unsigned int lowCount_;
++	bool disturbed_;
++};
++
++} /* namespace libcamera */
+diff --git a/src/libcamera/pipeline/simple/meson.build b/src/libcamera/pipeline/simple/meson.build
+index dda3de9..1150cf3 100644
+--- a/src/libcamera/pipeline/simple/meson.build
++++ b/src/libcamera/pipeline/simple/meson.build
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: CC0-1.0
+ 
+ libcamera_internal_sources += files([
++    'autofocus.cpp',
+     'simple.cpp',
+ ])
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index 90927bc..e1e54a0 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -50,6 +50,8 @@
+ #include "libcamera/internal/v4l2_subdevice.h"
+ #include "libcamera/internal/v4l2_videodevice.h"
+ 
++#include "autofocus.h"
++
+ namespace libcamera {
+ 
+ LOG_DEFINE_CATEGORY(SimplePipeline)
+@@ -343,8 +345,7 @@ public:
+ 	 */
+ 	std::list<Entity> entities_;
+ 	std::unique_ptr<CameraSensor> sensor_;
+-	CameraLens *focusLens_;
+-	int32_t focusPosition_;
++	std::unique_ptr<SimpleAutoFocus> autoFocus_;
+ 	V4L2VideoDevice *video_;
+ 	V4L2Subdevice *frameStartEmitter_;
+ 
+@@ -475,8 +476,7 @@ private:
+ SimpleCameraData::SimpleCameraData(SimplePipelineHandler *pipe,
+ 				   unsigned int numStreams,
+ 				   MediaEntity *sensor)
+-	: Camera::Private(pipe), streams_(numStreams), rawStream_(nullptr),
+-	  focusLens_(nullptr), focusPosition_(0)
++	: Camera::Private(pipe), streams_(numStreams), rawStream_(nullptr)
+ {
+ 	/*
+ 	 * Find the shortest path from the camera sensor to a video capture
+@@ -673,31 +673,24 @@ int SimpleCameraData::init()
+ 	properties_ = sensor_->properties();
+ 
+ 	/*
+-	 * Expose the native actuator position until a module-specific conversion
+-	 * to the dioptre units used by LensPosition has been calibrated.
++	 * Drive the focus lens, if any, with contrast-detect autofocus. The
++	 * native actuator position is exposed until a module-specific
++	 * conversion to the dioptre units of LensPosition is calibrated.
+ 	 */
+-	focusLens_ = sensor_->focusLens();
+-	if (focusLens_) {
+-		auto focus = focusLens_->controls().find(V4L2_CID_FOCUS_ABSOLUTE);
+-		if (focus == focusLens_->controls().end()) {
++	CameraLens *lens = sensor_->focusLens();
++	if (lens) {
++		auto focus = lens->controls().find(V4L2_CID_FOCUS_ABSOLUTE);
++		if (focus == lens->controls().end()) {
+ 			LOG(SimplePipeline, Warning)
+ 				<< "Focus lens has no V4L2_CID_FOCUS_ABSOLUTE control";
+-			focusLens_ = nullptr;
+ 		} else {
++			autoFocus_ = std::make_unique<SimpleAutoFocus>(lens, focus->second);
++
+ 			ControlInfoMap::Map controlsMap(controlInfo_.begin(),
+ 							 controlInfo_.end());
+-			const ControlValue manual(controls::AfModeManual);
+-			const ControlValue idle(controls::AfStateIdle);
+-
+-			controlsMap.emplace(&controls::AfMode,
+-					    ControlInfo(manual, manual, manual));
+-			controlsMap.emplace(&controls::AfState,
+-					    ControlInfo(idle, idle, idle));
+-			controlsMap.emplace(&controls::draft::FocusAbsolute,
+-					    focus->second);
++			autoFocus_->addControls(controlsMap);
+ 			controlInfo_ = ControlInfoMap(std::move(controlsMap),
+ 						  controls::controls);
+-			focusPosition_ = focus->second.def().get<int32_t>();
+ 		}
+ 	}
+ 
+@@ -1076,6 +1069,10 @@ void SimpleCameraData::metadataReady(uint32_t frame, const ControlList &metadata
+ 		return;
+ 
+ 	info->request->_d()->metadata().merge(metadata);
++	if (autoFocus_) {
++		autoFocus_->process(frame, metadata);
++		autoFocus_->fillMetadata(info->request->_d()->metadata());
++	}
+ 	info->metadataProcessed = true;
+ 	tryCompleteRequest(info->request);
+ }
+@@ -1727,8 +1724,8 @@ int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlL
+ 	 * Power the focus actuator only while streaming, and restore the last
+ 	 * position as the actuator loses it when powered down.
+ 	 */
+-	if (data->focusLens_) {
+-		ret = data->focusLens_->setFocusPosition(data->focusPosition_);
++	if (data->autoFocus_) {
++		ret = data->autoFocus_->start();
+ 		if (ret)
+ 			LOG(SimplePipeline, Warning)
+ 				<< "Failed to power up the focus lens: " << ret;
+@@ -1823,8 +1820,8 @@ void SimplePipelineHandler::stopDevice(Camera *camera)
+ 	data->clearIncompleteRequests();
+ 	data->conversionBuffers_.clear();
+ 
+-	if (data->focusLens_)
+-		data->focusLens_->close();
++	if (data->autoFocus_)
++		data->autoFocus_->stop();
+ 
+ 	releasePipeline(data);
+ }
+@@ -1834,22 +1831,12 @@ int SimplePipelineHandler::queueRequestDevice(Camera *camera, Request *request)
+ 	SimpleCameraData *data = cameraData(camera);
+ 	int ret;
+ 
+-	if (data->focusLens_) {
+-		const auto &position =
+-			request->controls().get(controls::draft::FocusAbsolute);
+-		if (position) {
+-			ret = data->focusLens_->setFocusPosition(*position);
+-			if (ret < 0)
+-				return ret;
+-
+-			data->focusPosition_ = *position;
+-		}
++	if (data->autoFocus_) {
++		ret = data->autoFocus_->queueRequest(request->controls());
++		if (ret < 0)
++			return ret;
+ 
+-		ControlList &metadata = request->_d()->metadata();
+-		metadata.set(controls::AfMode, controls::AfModeManual);
+-		metadata.set(controls::AfState, controls::AfStateIdle);
+-		metadata.set(controls::draft::FocusAbsolute,
+-			     data->focusPosition_);
++		data->autoFocus_->fillMetadata(request->_d()->metadata());
+ 	}
+ 
+ 	std::map<const Stream *, FrameBuffer *> buffers;
+-- 
+2.47.3
+

@@ -1,0 +1,5 @@
+Name: Fontconfig
+Description: Font configuration and customization library
+Version: 2.15.0
+Libs: -l:libfontconfig.so.1
+Cflags:

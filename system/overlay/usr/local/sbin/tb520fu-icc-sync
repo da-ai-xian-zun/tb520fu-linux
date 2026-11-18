@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Force sync_state on interconnect providers still waiting for a consumer that
+# never binds (1dfa000.crypto has no driver on mdss32 and older): otherwise
+# their boot-time INT_MAX votes keep DDR at 4224 MHz even in suspend.
+# Not needed once the DTB disables &crypto; harmless then (nothing to do).
+for d in /sys/bus/platform/drivers/qnoc-sm8650/*/; do
+	f=$d/state_synced
+	[ -w "$f" ] && [ "$(cat $f)" = 0 ] || continue
+	printf 1 > "$f" && echo "forced sync_state: $(basename $d)"
+done

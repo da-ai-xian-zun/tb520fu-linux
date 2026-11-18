@@ -1,0 +1,1156 @@
+From aa01b4ab00e61fab0ec5a85f715c035a89f39f60 Mon Sep 17 00:00:00 2001
+From: da-ai-xian-zun <163512031+da-ai-xian-zun@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 02:01:50 -0800
+Subject: [PATCH] tb520fu: panel EDR (backlight + HBM ~900-nit headroom) +
+ 10-bit probe CRTC reset fix
+
+---
+ niri-config/src/output.rs            |  13 +-
+ src/backend/mod.rs                   |   4 +
+ src/backend/panel_edr.rs             | 391 +++++++++++++++++++++++++++
+ src/backend/tty.rs                   |  86 +++++-
+ src/niri.rs                          |  41 ++-
+ src/render_helpers/blend.rs          | 150 ++++++++--
+ src/render_helpers/shader_element.rs |   4 +
+ src/render_helpers/shaders/hdr.frag  |  62 +++++
+ src/render_helpers/shaders/mod.rs    |  16 ++
+ src/tests/color_management.rs        |   1 +
+ 10 files changed, 730 insertions(+), 38 deletions(-)
+ create mode 100644 src/backend/panel_edr.rs
+
+diff --git a/niri-config/src/output.rs b/niri-config/src/output.rs
+index 7075104..7cb3645 100644
+--- a/niri-config/src/output.rs
++++ b/niri-config/src/output.rs
+@@ -158,6 +158,14 @@ pub struct Hdr {
+     /// in HDR mode. Defaults to 203 cd/m² (the BT.2408 reference white) when unset.
+     #[knuffel(child, unwrap(argument))]
+     pub reference_luminance: Option<FloatOrInt<0, 10000>>,
++    /// Luminance, in cd/m², of an SDR-only built-in panel at full backlight (no HDR signalling).
++    ///
++    /// When set on an output whose connector cannot signal HDR (e.g. a DSI panel), niri uses
++    /// "panel EDR" instead: while HDR content is shown it raises the backlight to full through
++    /// `tb520fu-daemon` and dims SDR content by the same ratio, so the desktop looks unchanged
++    /// and HDR highlights use the extra headroom.
++    #[knuffel(child, unwrap(argument))]
++    pub panel_peak_luminance: Option<FloatOrInt<1, 10000>>,
+ }
+ 
+ /// When HDR engages on an `hdr`-enabled output.
+@@ -172,6 +180,8 @@ pub enum HdrMode {
+     /// PQ/BT.2020 content — so applications that only probe HDR support once at startup (e.g.
+     /// many SDL games) detect it.
+     On,
++    /// HDR is explicitly disabled on this output.
++    Off,
+ }
+ 
+ impl std::str::FromStr for HdrMode {
+@@ -181,8 +191,9 @@ impl std::str::FromStr for HdrMode {
+         match s {
+             "auto" => Ok(Self::Auto),
+             "on" => Ok(Self::On),
++            "off" => Ok(Self::Off),
+             _ => Err(miette::miette!(
+-                r#"invalid HDR mode, can be "auto" or "on""#
++                r#"invalid HDR mode, can be "auto", "on", or "off""#
+             )),
+         }
+     }
+diff --git a/src/backend/mod.rs b/src/backend/mod.rs
+index c928f35..f1c929a 100644
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -11,6 +11,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+ use crate::niri::Niri;
+ use crate::utils::id::IdCounter;
+ 
++pub mod panel_edr;
+ pub mod tty;
+ pub use tty::Tty;
+ 
+@@ -36,6 +37,9 @@ pub enum Backend {
+ #[derive(Debug, Clone, Copy, Default)]
+ pub struct OutputHdrCaps {
+     pub supported: bool,
++    /// HDR is done as panel EDR (backlight headroom, no connector signalling); see
++    /// `Hdr::panel_peak_luminance`. `max_luminance` then holds the panel's full-backlight peak.
++    pub panel: bool,
+     /// Desired content max luminance from the EDID, in cd/m² (0 = not provided).
+     pub max_luminance: u16,
+     /// Desired content min luminance from the EDID, in 0.0001 cd/m² units (0 = not provided).
+diff --git a/src/backend/panel_edr.rs b/src/backend/panel_edr.rs
+new file mode 100644
+index 0000000..1c3e971
+--- /dev/null
++++ b/src/backend/panel_edr.rs
+@@ -0,0 +1,391 @@
++//! Panel EDR: HDR headroom on an SDR-only built-in panel through its backlight + HBM.
++//!
++//! A DSI panel has no HDR signalling, but it does have a backlight that is usually far from
++//! full plus KTZ8866 High Brightness Mode (`0x15` 20.4 / 25.2 / 28.4 mA, up to ~905 cd/m²).
++//! While HDR content is on screen, niri raises the backlight towards full (and asks
++//! `tb520fu-daemon` for HBM headroom when `panel-peak-luminance` > 650 cd/m²) and dims SDR
++//! content by the exact confirmed luminance ratio, so the desktop keeps its brightness and HDR
++//! highlights get the headroom (the approach KWin and Android use on laptop/tablet panels).
++//!
++//! The backlight and HBM duty-cycle / thermal safety policy are owned by `tb520fu-daemon`:
++//! `{"cmd":"edr","raw":N,"hbm":H}` raises the backlight to `N` with requested HBM step `H`
++//! (`0..=2`), and `{"cmd":"edr","raw":null,"hbm":0}` restores user brightness and HBM=0.
++//! The daemon replies with its status, including `backlight_raw` and `hbm_gain` (`1.0`,
++//! `1.2353`, or `1.3922`) actually applied after rolling 300s/1800s budget and thermal checks.
++//!
++//! Safety: SDR content is only dimmed by the luminance ratio the daemon *confirmed*, so if the
++//! daemon is missing, refuses, or steps HBM down on thermal/duty-cycle limits, frames follow
++//! the confirmed level smoothly instead of over-dimming or jumping.
++
++use std::io::{BufRead, BufReader, Write};
++use std::os::unix::net::UnixStream;
++use std::sync::mpsc::{self, RecvTimeoutError};
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
++
++use crate::render_helpers::blend::{PanelBlend, DEFAULT_REFERENCE_LUMINANCE};
++
++const DAEMON_SOCK: &str = "/run/tb520fu-daemon.sock";
++const BACKLIGHT_DIR: &str = "/sys/class/backlight/ktz8866-backlight";
++
++/// Full-backlight (raw = 2047) luminance at HBM=0 (20.4 mA), per Android display calibration.
++const BASE_PEAK_NITS: f32 = 650.0;
++/// Time to ramp the panel luminance between the user's SDR white and configured peak.
++const RAMP: Duration = Duration::from_millis(400);
++/// Interval at which the IPC thread repeats the current level and syncs daemon HBM gain.
++const KEEPALIVE: Duration = Duration::from_millis(250);
++/// How often the user's brightness is re-read from sysfs while EDR is idle.
++const SYSFS_POLL: Duration = Duration::from_millis(500);
++/// After ending EDR, sysfs may still show the raised level until the daemon restores it.
++const RESTORE_GRACE: Duration = Duration::from_millis(1000);
++
++#[derive(Debug, Clone, Copy)]
++struct Shared {
++    /// The user's (SDR) brightness as reported by the daemon while EDR is engaged.
++    user_raw: Option<i64>,
++    /// The backlight value the daemon applied for our EDR request, if EDR is engaged.
++    applied_raw: Option<i64>,
++    /// Multiplicative luminance gain confirmed by `tb520fu-daemon` for active HBM (`>= 1.0`).
++    hbm_gain: f32,
++    /// True when the daemon capped HBM due to rolling 300s/1800s budget or battery temperature.
++    hbm_throttled: bool,
++}
++
++impl Default for Shared {
++    fn default() -> Self {
++        Self {
++            user_raw: None,
++            applied_raw: None,
++            hbm_gain: 1.0,
++            hbm_throttled: false,
++        }
++    }
++}
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum Cmd {
++    Set { raw: i64, hbm: u8 },
++    End,
++}
++
++pub struct PanelEdr {
++    tx: mpsc::Sender<Cmd>,
++    shared: Arc<Mutex<Shared>>,
++    max_raw: i64,
++    user_raw: i64,
++    /// 0 = user's brightness, 1 = configured `panel-peak-luminance`.
++    level: f32,
++    target: f32,
++    last_tick: Option<Instant>,
++    engaged: bool,
++    last_sent: Option<(i64, u8)>,
++    next_poll: Option<Instant>,
++}
++
++impl PanelEdr {
++    pub fn new() -> Self {
++        let max_raw = read_sysfs_i64("max_brightness").filter(|&m| m > 0).unwrap_or(2047);
++        let user_raw = read_sysfs_i64("brightness").unwrap_or(max_raw / 2).clamp(1, max_raw);
++        let shared = Arc::new(Mutex::new(Shared::default()));
++        let (tx, rx) = mpsc::channel();
++
++        let shared_worker = shared.clone();
++        let res = std::thread::Builder::new()
++            .name("panel-edr-ipc".into())
++            .spawn(move || ipc_thread(rx, shared_worker));
++        if let Err(err) = res {
++            warn!("error spawning panel EDR IPC thread: {err:?}");
++        }
++
++        Self {
++            tx,
++            shared,
++            max_raw,
++            user_raw,
++            level: 0.,
++            target: 0.,
++            last_tick: None,
++            engaged: false,
++            last_sent: None,
++            next_poll: None,
++        }
++    }
++
++    #[inline]
++    fn base_full(peak_full: f32) -> f32 {
++        peak_full.min(BASE_PEAK_NITS)
++    }
++
++    /// The user's SDR white luminance at HBM=0, in cd/m².
++    pub fn sdr_luminance(&self, peak_full: f32) -> f32 {
++        let base = Self::base_full(peak_full);
++        (base * (self.user_raw as f32 / self.max_raw as f32)).max(1.)
++    }
++
++    /// How far above the user's SDR white the panel can go, as a ratio (>= 1).
++    pub fn headroom(&self, peak_full: f32) -> f32 {
++        let base = Self::base_full(peak_full);
++        let sdr = self.sdr_luminance(peak_full);
++        let sh = *self.shared.lock().unwrap();
++        let effective_peak = if self.engaged && sh.hbm_throttled {
++            base * sh.hbm_gain.max(1.0)
++        } else {
++            peak_full.max(base)
++        };
++        (effective_peak / sdr).max(1.)
++    }
++
++    /// Whether the backlight is still moving, so the output needs more frames.
++    pub fn is_animating(&self) -> bool {
++        if self.level != self.target {
++            return true;
++        }
++        // Keep drawing until the daemon has confirmed the raw level we asked for, so the SDR
++        // dimming catches up with the backlight.
++        let applied = self.shared.lock().unwrap().applied_raw;
++        self.engaged && applied != self.last_sent.map(|(r, _)| r)
++    }
++
++    /// Advances the backlight/HBM ramp towards `want` (HDR content on screen) and returns the
++    /// panel blend for the frame being rendered, or `None` for a plain SDR frame.
++    pub fn tick(&mut self, want: bool, peak_full: f32) -> Option<PanelBlend> {
++        let now = Instant::now();
++        let dt = self
++            .last_tick
++            .map(|t| now.saturating_duration_since(t))
++            .unwrap_or_default()
++            .min(Duration::from_millis(100));
++        self.last_tick = Some(now);
++
++        self.target = if want { 1. } else { 0. };
++        let step = dt.as_secs_f32() / RAMP.as_secs_f32();
++        if self.level < self.target {
++            self.level = (self.level + step).min(self.target);
++        } else if self.level > self.target {
++            self.level = (self.level - step).max(self.target);
++        }
++        // The first tick after a pause has dt = 0; make sure the ramp still starts.
++        if want && self.level == 0. {
++            self.level = f32::EPSILON;
++        }
++
++        let shared = *self.shared.lock().unwrap();
++        if self.engaged {
++            if let Some(user) = shared.user_raw {
++                self.user_raw = user.clamp(1, self.max_raw);
++            }
++        } else if self.next_poll.is_none_or(|t| now >= t) {
++            self.next_poll = Some(now + SYSFS_POLL);
++            if let Some(raw) = read_sysfs_i64("brightness") {
++                self.user_raw = raw.clamp(1, self.max_raw);
++            }
++        }
++
++        let base = Self::base_full(peak_full);
++        let sdr_lum = self.sdr_luminance(peak_full);
++
++        if self.level > 0. {
++            let t = self.level * self.level * (3. - 2. * self.level);
++            let goal_peak = peak_full.max(sdr_lum);
++            let desired_nits = sdr_lum + (goal_peak - sdr_lum) * t;
++            let raw = if desired_nits >= base {
++                self.max_raw
++            } else {
++                ((desired_nits / base.max(1.)) * self.max_raw as f32).round() as i64
++            }
++            .clamp(self.user_raw, self.max_raw);
++
++            let want_hbm = if raw < self.max_raw || peak_full <= BASE_PEAK_NITS + 10. {
++                0
++            } else if peak_full >= 850. && desired_nits >= 820. {
++                2
++            } else if peak_full >= 740. && desired_nits >= 725. {
++                1
++            } else {
++                0
++            };
++
++            if self.last_sent != Some((raw, want_hbm)) {
++                let _ = self.tx.send(Cmd::Set { raw, hbm: want_hbm });
++                self.last_sent = Some((raw, want_hbm));
++            }
++            self.engaged = true;
++        } else if self.engaged {
++            let _ = self.tx.send(Cmd::End);
++            self.engaged = false;
++            self.last_sent = None;
++            self.next_poll = Some(now + RESTORE_GRACE);
++        }
++
++        let applied = if self.engaged {
++            shared.applied_raw
++        } else {
++            None
++        }?;
++        let gain = if self.engaged {
++            shared.hbm_gain.max(1.0)
++        } else {
++            1.0
++        };
++        let confirmed_peak = base * (applied as f32 / self.max_raw as f32) * gain;
++        if confirmed_peak <= sdr_lum + 0.5 {
++            return None;
++        }
++        Some(PanelBlend {
++            sdr_luminance: sdr_lum,
++            peak_luminance: confirmed_peak,
++            reference_luminance: DEFAULT_REFERENCE_LUMINANCE as f32,
++        })
++    }
++
++    /// Restores the user's brightness immediately (session paused, output gone, HDR disabled).
++    pub fn stop(&mut self) {
++        if self.engaged {
++            let _ = self.tx.send(Cmd::End);
++        }
++        self.engaged = false;
++        self.level = 0.;
++        self.target = 0.;
++        self.last_sent = None;
++        self.last_tick = None;
++        self.next_poll = Some(Instant::now() + RESTORE_GRACE);
++    }
++}
++
++impl Drop for PanelEdr {
++    fn drop(&mut self) {
++        self.stop();
++    }
++}
++
++fn read_sysfs_i64(name: &str) -> Option<i64> {
++    std::fs::read_to_string(format!("{BACKLIGHT_DIR}/{name}"))
++        .ok()?
++        .trim()
++        .parse()
++        .ok()
++}
++
++struct Conn {
++    stream: UnixStream,
++    reader: BufReader<UnixStream>,
++}
++
++impl Conn {
++    fn connect() -> std::io::Result<Self> {
++        let stream = UnixStream::connect(DAEMON_SOCK)?;
++        stream.set_read_timeout(Some(Duration::from_millis(500)))?;
++        stream.set_write_timeout(Some(Duration::from_millis(500)))?;
++        let reader = BufReader::new(stream.try_clone()?);
++        Ok(Self { stream, reader })
++    }
++
++    fn request(&mut self, req: Option<(i64, u8)>) -> std::io::Result<serde_json::Value> {
++        let msg = match req {
++            Some((raw, hbm)) => serde_json::json!({ "cmd": "edr", "raw": raw, "hbm": hbm }),
++            None => serde_json::json!({ "cmd": "edr", "raw": null, "hbm": 0 }),
++        };
++        let mut line = msg.to_string();
++        line.push('\n');
++        self.stream.write_all(line.as_bytes())?;
++        let mut reply = String::new();
++        if self.reader.read_line(&mut reply)? == 0 {
++            return Err(std::io::ErrorKind::UnexpectedEof.into());
++        }
++        serde_json::from_str(&reply).map_err(std::io::Error::other)
++    }
++}
++
++fn ipc_thread(rx: mpsc::Receiver<Cmd>, shared: Arc<Mutex<Shared>>) {
++    let mut conn: Option<Conn> = None;
++    // The (raw, hbm) level to keep re-sending while engaged.
++    let mut current: Option<(i64, u8)> = None;
++    let mut warned = false;
++
++    loop {
++        let cmd = match rx.recv_timeout(KEEPALIVE) {
++            Ok(cmd) => Some(cmd),
++            Err(RecvTimeoutError::Timeout) => None,
++            Err(RecvTimeoutError::Disconnected) => break,
++        };
++        // Coalesce queued commands: only the newest matters.
++        let mut cmd = cmd;
++        while let Ok(next) = rx.try_recv() {
++            cmd = Some(next);
++        }
++
++        let req = match cmd {
++            Some(Cmd::Set { raw, hbm }) => {
++                current = Some((raw, hbm));
++                Some((raw, hbm))
++            }
++            Some(Cmd::End) => {
++                current = None;
++                None
++            }
++            None => match current {
++                // Keepalive.
++                Some(pair) => Some(pair),
++                None => continue,
++            },
++        };
++
++        let mut reply = None;
++        for _ in 0..2 {
++            if conn.is_none() {
++                conn = Conn::connect().ok();
++            }
++            let Some(c) = conn.as_mut() else { break };
++            match c.request(req) {
++                Ok(v) => {
++                    reply = Some(v);
++                    break;
++                }
++                Err(_) => conn = None,
++            }
++        }
++
++        let mut sh = shared.lock().unwrap();
++        match reply {
++            Some(v) => {
++                warned = false;
++                let edr = v.get("edr").and_then(|x| x.as_bool()).unwrap_or(false);
++                sh.user_raw = v.get("brightness_raw").and_then(|x| x.as_i64());
++                sh.applied_raw = if edr && req.is_some() {
++                    v.get("backlight_raw").and_then(|x| x.as_i64())
++                } else {
++                    None
++                };
++                sh.hbm_gain = if edr && req.is_some() {
++                    v.get("hbm_gain")
++                        .and_then(|x| x.as_f64())
++                        .map(|g| g as f32)
++                        .filter(|&g| g >= 1.0)
++                        .unwrap_or(1.0)
++                } else {
++                    1.0
++                };
++                sh.hbm_throttled = v
++                    .get("hbm_throttled")
++                    .and_then(|x| x.as_bool())
++                    .unwrap_or(false);
++            }
++            None => {
++                if !warned {
++                    warn!("panel EDR: tb520fu-daemon unreachable at {DAEMON_SOCK}");
++                    warned = true;
++                }
++                sh.applied_raw = None;
++                sh.hbm_gain = 1.0;
++                sh.hbm_throttled = false;
++            }
++        }
++    }
++
++    // niri is shutting down: make sure the backlight goes back to the user's level.
++    if current.is_some() {
++        if let Ok(mut c) = Conn::connect() {
++            let _ = c.request(None);
++        }
++    }
++}
+diff --git a/src/backend/tty.rs b/src/backend/tty.rs
+index 6341adc..222921a 100644
+--- a/src/backend/tty.rs
++++ b/src/backend/tty.rs
+@@ -72,7 +72,8 @@ use smithay::wayland::color::management::{
+     PrimariesOption as CmPrimariesOption, TransferFunction as CmTransferFunction,
+ };
+ 
+-use crate::render_helpers::blend::{self, set_frame_blend, DEFAULT_REFERENCE_LUMINANCE};
++use super::panel_edr::PanelEdr;
++use crate::render_helpers::blend::{self, set_frame_blend, FrameBlend, DEFAULT_REFERENCE_LUMINANCE};
+ 
+ use crate::niri::{Niri, RedrawState, State};
+ use crate::render_helpers::debug::draw_damage;
+@@ -418,10 +419,11 @@ struct Surface {
+     /// The last color state we tried to stage and the driver rejected. Tracked so a rejected
+     /// state isn't re-tested every frame (each test is an atomic TEST_ONLY commit).
+     failed_color_state: Option<ConnectorColorState>,
+-    /// The blend space of the last rendered frame: `Some(reference luminance)` = HDR, `None`
+-    /// = SDR. Blend changes alter shader output without damaging anything, so a change forces
+-    /// a full redraw.
+-    last_blend: Option<Option<f64>>,
++    /// The blend space of the last rendered frame (`None` = SDR). Blend changes alter shader
++    /// output without damaging anything, so a change forces a full redraw.
++    last_blend: Option<Option<FrameBlend>>,
++    /// Backlight-headroom HDR for an SDR-only panel (`hdr { panel-peak-luminance }`).
++    panel_edr: Option<PanelEdr>,
+     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
+     gamma_props: Option<GammaProps>,
+     /// Gamma change to apply upon session resume.
+@@ -676,6 +678,11 @@ impl Tty {
+                 self.libinput.suspend();
+ 
+                 for device in self.devices.values_mut() {
++                    for surface in device.surfaces.values_mut() {
++                        if let Some(edr) = surface.panel_edr.as_mut() {
++                            edr.stop();
++                        }
++                    }
+                     device.drm.pause();
+ 
+                     if let Some(lease_state) = &mut device.drm_lease_state {
+@@ -1424,6 +1431,13 @@ impl Tty {
+             .map(|info| EdidHdrInfo::from_edid(&info))
+             .unwrap_or_default();
+         let hdr_supported = supports_bt2020 && supports_hdr_metadata && edid_hdr.pq;
++        // Without HDR signalling, an opted-in built-in panel does HDR through its backlight.
++        let panel_peak = config
++            .hdr
++            .as_ref()
++            .and_then(|h| h.panel_peak_luminance)
++            .map(|v| v.0)
++            .filter(|_| !hdr_supported);
+         debug!(
+             supports_bt2020,
+             supports_hdr_metadata,
+@@ -1432,7 +1446,9 @@ impl Tty {
+             ?max_bpc_range,
+             "connector color capabilities"
+         );
+-        if config.hdr.is_some() && !hdr_supported {
++        if let Some(peak) = panel_peak {
++            info!("output {connector_name}: HDR via panel EDR (backlight headroom, {peak} cd/m² peak)");
++        } else if config.hdr.is_some() && !hdr_supported {
+             warn!(
+                 "output {connector_name}: hdr is enabled in the config, but the driver or \
+                  display does not support it (Colorspace BT2020_RGB: {supports_bt2020}, \
+@@ -1493,8 +1509,11 @@ impl Tty {
+             .insert_if_missing(|| TtyOutputState { node, crtc });
+         output.user_data().insert_if_missing(|| output_name.clone());
+         output.user_data().insert_if_missing(|| OutputHdrCaps {
+-            supported: hdr_supported,
+-            max_luminance: edid_hdr.max_luminance,
++            supported: hdr_supported || panel_peak.is_some(),
++            panel: panel_peak.is_some(),
++            max_luminance: panel_peak
++                .map(|p| p.round() as u16)
++                .unwrap_or(edid_hdr.max_luminance),
+             min_luminance: edid_hdr.min_luminance,
+             max_frame_avg_luminance: edid_hdr.max_frame_avg_luminance,
+         });
+@@ -1554,7 +1573,8 @@ impl Tty {
+         // driver that hangs on 10-bit scanout (set the var -> boots fine) from one that hangs on the
+         // HDR infoframe commit itself (still hangs). Remove once HDR on nvidia is understood.
+         let force_8bit = std::env::var_os("NIRI_HDR_FORCE_8BIT").is_some();
+-        let mut using_10bit_formats = config.hdr.is_some() && hdr_supported && !force_8bit;
++        let mut using_10bit_formats =
++            config.hdr.is_some() && (hdr_supported || panel_peak.is_some()) && !force_8bit;
+         let mut hdr_color_formats = Vec::new();
+ 
+         if using_10bit_formats {
+@@ -1645,6 +1665,14 @@ impl Tty {
+             } else {
+                 hdr_color_formats.extend(SDR_COLOR_FORMATS);
+             }
++
++            // Dropping each probe surface clears the CRTC (smithay disables it on drop), but
++            // the real surface above still caches the pre-probe kernel state (e.g. CRTC active
++            // from the greeter). Re-read it so the first real commit is a full modeset rather
++            // than a page flip onto a disabled CRTC, which the kernel rejects with EINVAL.
++            if let Err(err) = surface.reset_state() {
++                warn!(connector = connector_name, "error resetting surface state after 10-bit probe: {err:?}");
++            }
+         }
+ 
+         let mut color_formats: &[Fourcc] = if using_10bit_formats {
+@@ -1858,6 +1886,7 @@ impl Tty {
+             max_bpc_range,
+             failed_color_state: None,
+             last_blend: None,
++            panel_edr: panel_peak.map(|_| PanelEdr::new()),
+             compositor,
+             dmabuf_feedback,
+             gamma_props,
+@@ -2209,10 +2238,10 @@ impl Tty {
+         // The connector state is only *staged* here; smithay applies it inside its own commit
+         // as a single atomic modeset together with mode, CRTC and plane state (committing
+         // connector color properties standalone hangs some drivers, notably nvidia).
+-        let (blend_hdr, hdr_content, reference_luminance) = {
++        let (blend_hdr, hdr_content, reference_luminance, panel_blend) = {
+             let config = self.config.borrow();
+             let output_config = config.outputs.find(&surface.name);
+-            let hdr_config = output_config.and_then(|o| o.hdr.clone());
++            let hdr_config = output_config.and_then(|o| o.hdr.clone()).filter(|h| h.mode != HdrMode::Off);
+             let hdr_allowed = hdr_config.is_some() && surface.hdr_supported;
+             let max_bpc = output_config
+                 .map(|o| effective_max_bpc(o, &surface.max_bpc_range))
+@@ -2230,6 +2259,24 @@ impl Tty {
+                 .flatten();
+             let blend_hdr = hdr_allowed && (always_on || hdr_desc.is_some());
+ 
++            // Panel EDR: no signalling; raise the backlight while HDR content is shown.
++            let panel_peak = hdr_config
++                .as_ref()
++                .and_then(|h| h.panel_peak_luminance)
++                .map(|v| v.0 as f32)
++                .filter(|_| !surface.hdr_supported);
++            let mut panel_blend = None;
++            if let (Some(peak), Some(edr)) = (panel_peak, surface.panel_edr.as_mut()) {
++                let want = always_on || niri.output_hdr_image_description(output).is_some();
++                panel_blend = edr.tick(want, peak);
++                if let Some(state) = niri.output_state.get_mut(output) {
++                    state.unfinished_animations_remain |= edr.is_animating();
++                }
++                blend::set_panel_headroom(output, edr.headroom(peak));
++            } else if let Some(edr) = surface.panel_edr.as_mut() {
++                edr.stop();
++            }
++
+             let desired = if blend_hdr {
+                 // Without fullscreen HDR content, the metadata comes from the sink's EDID.
+                 let desc = hdr_desc.unwrap_or(ImageDescription {
+@@ -2278,12 +2325,16 @@ impl Tty {
+                 }
+             }
+ 
+-            (blend_hdr, hdr_desc.is_some(), reference_luminance)
++            (blend_hdr, hdr_desc.is_some(), reference_luminance, panel_blend)
+         };
+ 
+         // A blend-space change alters what every shader outputs without any element damage;
+         // force a full redraw.
+-        let blend = blend_hdr.then_some(reference_luminance);
++        let blend = if blend_hdr {
++            Some(FrameBlend::Pq(reference_luminance))
++        } else {
++            panel_blend.map(FrameBlend::Panel)
++        };
+         if surface.last_blend != Some(blend) {
+             surface.last_blend = Some(blend);
+             surface.compositor.reset_buffers();
+@@ -2354,6 +2405,12 @@ impl Tty {
+                     flags.remove(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT);
+                     flags.remove(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY);
+                 }
++            } else if panel_blend.is_some() {
++                // Every pixel (SDR dimming, PQ decode) has to go through the blend shader.
++                flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
++                flags.remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
++                flags.remove(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT);
++                flags.remove(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY);
+             }
+ 
+             flags
+@@ -2692,6 +2749,9 @@ impl Tty {
+ 
+         for device in self.devices.values_mut() {
+             for surface in device.surfaces.values_mut() {
++                if let Some(edr) = surface.panel_edr.as_mut() {
++                    edr.stop();
++                }
+                 if let Err(err) = surface.compositor.clear() {
+                     warn!("error clearing drm surface: {err:?}");
+                 }
+diff --git a/src/niri.rs b/src/niri.rs
+index 95391e7..4f07ea7 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -2272,7 +2272,7 @@ impl Niri {
+             return None;
+         }
+         let name = output.user_data().get::<OutputName>()?;
+-        let hdr = self.config.borrow().outputs.find(name)?.hdr.clone()?;
++        let hdr = self.config.borrow().outputs.find(name)?.hdr.clone().filter(|h| h.mode != HdrMode::Off)?;
+         Some((hdr, caps))
+     }
+ 
+@@ -2281,15 +2281,40 @@ impl Niri {
+     fn hdr_blend_description(
+         hdr: &niri_config::output::Hdr,
+         caps: OutputHdrCaps,
++        output: &Output,
+     ) -> ImageDescription {
+         // Same placeholder as build_hdr_metadata() in the TTY backend uses for sinks whose
+         // EDID doesn't provide luminance data.
+-        let max_luminance = if caps.max_luminance > 0 {
++        let mut max_luminance = if caps.max_luminance > 0 {
+             u32::from(caps.max_luminance)
+         } else {
+             500
+         };
+-        let reference_luminance = hdr.reference_luminance.map(|v| v.0).unwrap_or(203.) as u32;
++        let mut reference_luminance =
++            hdr.reference_luminance.map(|v| v.0).unwrap_or(203.) as u32;
++        if caps.panel {
++            // Panel EDR maps HDR reference white onto the user's SDR white, so the usable
++            // range above reference white is the backlight headroom.
++            reference_luminance = crate::render_helpers::blend::DEFAULT_REFERENCE_LUMINANCE as u32;
++            let headroom = crate::render_helpers::blend::panel_headroom(output).unwrap_or(1.);
++            // Quantize so small brightness changes don't spam clients with new descriptions.
++            let headroom = (headroom * 4.).round() / 4.;
++            max_luminance = (reference_luminance as f32 * headroom.max(1.)).round() as u32;
++            return ImageDescription {
++                transfer: CmTransferFunction::St2084Pq,
++                primaries: CmPrimariesOption {
++                    named: Some(CmPrimaries::Bt2020),
++                    values: None,
++                },
++                max_cll: None,
++                max_fall: None,
++                mastering_luminance: None,
++                mastering_primaries: None,
++                luminances: Some((0, max_luminance, reference_luminance)),
++                windows_scrgb: false,
++                windows_bt2100: false,
++            };
++        }
+         ImageDescription {
+             transfer: CmTransferFunction::St2084Pq,
+             primaries: CmPrimariesOption {
+@@ -2321,10 +2346,11 @@ impl Niri {
+             return ImageDescription::SRGB;
+         };
+         match hdr.mode {
+-            HdrMode::On => Self::hdr_blend_description(&hdr, caps),
++            HdrMode::Off => ImageDescription::SRGB,
++            HdrMode::On => Self::hdr_blend_description(&hdr, caps, output),
+             HdrMode::Auto => {
+                 if self.output_hdr_image_description(output).is_some() {
+-                    Self::hdr_blend_description(&hdr, caps)
++                    Self::hdr_blend_description(&hdr, caps, output)
+                 } else {
+                     ImageDescription::SRGB
+                 }
+@@ -2348,7 +2374,8 @@ impl Niri {
+             return ImageDescription::SRGB;
+         };
+         match hdr.mode {
+-            HdrMode::On => Self::hdr_blend_description(&hdr, caps),
++            HdrMode::Off => ImageDescription::SRGB,
++            HdrMode::On => Self::hdr_blend_description(&hdr, caps, output),
+             HdrMode::Auto => {
+                 let is_active_fullscreen = window.sizing_mode().is_fullscreen()
+                     && self
+@@ -2357,7 +2384,7 @@ impl Niri {
+                         .and_then(|mon| mon.active_window())
+                         .is_some_and(|active| active.id() == window.id());
+                 if is_active_fullscreen {
+-                    Self::hdr_blend_description(&hdr, caps)
++                    Self::hdr_blend_description(&hdr, caps, output)
+                 } else {
+                     ImageDescription::SRGB
+                 }
+diff --git a/src/render_helpers/blend.rs b/src/render_helpers/blend.rs
+index aab7254..2176232 100644
+--- a/src/render_helpers/blend.rs
++++ b/src/render_helpers/blend.rs
+@@ -81,6 +81,39 @@ impl ContentColor {
+     }
+ }
+ 
++/// Panel EDR parameters for one frame: an SDR-only panel whose backlight is raised above the
++/// user's SDR brightness to make room for HDR highlights.
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct PanelBlend {
++    /// Luminance the user's SDR white should keep, in cd/m².
++    pub sdr_luminance: f32,
++    /// The panel's current full-scale luminance (backlight level), in cd/m².
++    pub peak_luminance: f32,
++    /// Reference white of HDR content, in cd/m² (mapped onto `sdr_luminance`).
++    pub reference_luminance: f32,
++}
++
++impl PanelBlend {
++    /// Multiplier on 2.2-encoded SDR values.
++    pub fn sdr_gain(&self) -> f32 {
++        (self.sdr_luminance / self.peak_luminance.max(1.)).clamp(0., 1.).powf(1. / 2.2)
++    }
++
++    /// Multiplier on HDR content luminance.
++    pub fn hdr_gain(&self) -> f32 {
++        self.sdr_luminance / self.reference_luminance.max(1.)
++    }
++}
++
++/// The blend space a frame is rendered in.
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub enum FrameBlend {
++    /// PQ/BT.2020 with the given SDR reference luminance (HDR-signalled connector).
++    Pq(f64),
++    /// Panel EDR (no signalling).
++    Panel(PanelBlend),
++}
++
+ /// The blend state of the frame currently being rendered, stored in the renderer's EGL user
+ /// data (like [`super::shaders::Shaders`]).
+ ///
+@@ -90,6 +123,7 @@ impl ContentColor {
+ pub struct FrameBlendState {
+     hdr_pq: Cell<bool>,
+     ref_lum_scale: Cell<f32>,
++    panel: Cell<Option<PanelBlend>>,
+ }
+ 
+ impl FrameBlendState {
+@@ -108,36 +142,62 @@ impl FrameBlendState {
+ 
+     /// Marks the frames rendered from now on as HDR with the given SDR reference luminance,
+     /// or as SDR (`None`).
+-    pub fn set(renderer: &mut GlesRenderer, reference_luminance: Option<f64>) {
++    pub fn set(renderer: &mut GlesRenderer, blend: Option<FrameBlend>) {
+         let state = Self::get(renderer);
+-        match reference_luminance {
+-            Some(lum) => {
++        state.hdr_pq.set(false);
++        state.panel.set(None);
++        match blend {
++            Some(FrameBlend::Pq(lum)) => {
+                 state.hdr_pq.set(true);
+                 state.ref_lum_scale.set((lum / 10000.) as f32);
+             }
+-            None => state.hdr_pq.set(false),
++            Some(FrameBlend::Panel(panel)) => state.panel.set(Some(panel)),
++            None => (),
+         }
+     }
+ 
+-    fn values_from_frame(frame: &GlesFrame) -> (bool, f32) {
+-        let state: &Self = frame
++    fn state_from_frame<'a>(frame: &'a GlesFrame) -> &'a Self {
++        frame
+             .egl_context()
+             .user_data()
+             .get()
+-            .expect("FrameBlendState::init() must be called when creating the renderer");
++            .expect("FrameBlendState::init() must be called when creating the renderer")
++    }
++
++    fn values_from_frame(frame: &GlesFrame) -> (bool, f32) {
++        let state = Self::state_from_frame(frame);
+         (state.hdr_pq.get(), state.ref_lum_scale.get())
+     }
+ 
++    /// Whether the frame is rendered in panel EDR.
++    pub fn is_panel(frame: &GlesFrame) -> bool {
++        Self::state_from_frame(frame).panel.get().is_some()
++    }
++
+     /// The `niri_blend` uniform values for a draw of SDR content in this frame.
+-    pub fn uniforms(frame: &GlesFrame) -> [Uniform<'static>; 5] {
++    pub fn uniforms(frame: &GlesFrame) -> [Uniform<'static>; 9] {
+         Self::uniforms_for_content(frame, ContentColor::Sdr)
+     }
+ 
+     /// The `niri_blend` uniform values for a draw in this frame; [`ContentColor::BlendSpace`]
+     /// exempts content already encoded in the blend space, [`ContentColor::Linear`] selects
+     /// the absolute extended-linear encode.
+-    pub fn uniforms_for_content(frame: &GlesFrame, content: ContentColor) -> [Uniform<'static>; 5] {
++    pub fn uniforms_for_content(frame: &GlesFrame, content: ContentColor) -> [Uniform<'static>; 9] {
+         let (hdr_pq, scale) = Self::values_from_frame(frame);
++        let panel = Self::state_from_frame(frame).panel.get();
++        let (panel_mode, sdr_gain, hdr_gain, peak) = match panel {
++            Some(p) => (
++                match content {
++                    ContentColor::Sdr => 1.0f32,
++                    ContentColor::BlendSpace => 2.0,
++                    ContentColor::Linear { .. } => 3.0,
++                },
++                p.sdr_gain(),
++                p.hdr_gain(),
++                p.peak_luminance,
++            ),
++            None => (0.0, 0.0, 0.0, 0.0),
++        };
+         let apply = hdr_pq && content != ContentColor::BlendSpace;
+         let (linear, linear_scale, linear_to_ref) = match content {
+             ContentColor::Linear {
+@@ -157,22 +217,56 @@ impl FrameBlendState {
+             Uniform::new("niri_linear", linear),
+             Uniform::new("niri_linear_scale", linear_scale),
+             Uniform::new("niri_linear_to_ref", linear_to_ref),
++            Uniform::new("niri_panel", panel_mode),
++            Uniform::new("niri_panel_sdr_gain", sdr_gain),
++            Uniform::new("niri_panel_hdr_gain", hdr_gain),
++            Uniform::new("niri_panel_peak", peak),
+         ]
+     }
+ }
+ 
+-/// Configures the renderer for rendering frames in the given blend space: `Some(reference
+-/// luminance)` = HDR (PQ/BT.2020), `None` = SDR.
++/// Configures the renderer for rendering frames in the given blend space: PQ/BT.2020 (HDR
++/// signalling), panel EDR, or `None` = SDR.
+ ///
+ /// In HDR, texture draws using the default program go through the blend-space texture shader,
+ /// solid colors are encoded on the CPU, and niri's own shader programs read the frame blend
+ /// state for their `niri_blend` stage. Call with `None` after rendering the output so
+ /// screencasts, screenshots and other outputs stay SDR.
+-pub fn set_frame_blend(renderer: &mut GlesRenderer, reference_luminance: Option<f64>) {
+-    FrameBlendState::set(renderer, reference_luminance);
++pub fn set_frame_blend(renderer: &mut GlesRenderer, blend: Option<FrameBlend>) {
++    FrameBlendState::set(renderer, blend);
+ 
+-    match reference_luminance {
+-        Some(lum) => {
++    match blend {
++        Some(FrameBlend::Panel(panel)) => {
++            let program = Shaders::get(renderer).texture_hdr.clone();
++            let sdr_gain = panel.sdr_gain();
++            if let Some(program) = program {
++                renderer.set_default_tex_program_override(Some((
++                    program,
++                    vec![
++                        Uniform::new("niri_hdr_pq", 0.0f32),
++                        Uniform::new("niri_ref_lum_scale", 0.0f32),
++                        Uniform::new("niri_linear", 0.0f32),
++                        Uniform::new("niri_linear_scale", 0.0f32),
++                        Uniform::new("niri_linear_to_ref", 0.0f32),
++                        Uniform::new("niri_panel", 1.0f32),
++                        Uniform::new("niri_panel_sdr_gain", sdr_gain),
++                        Uniform::new("niri_panel_hdr_gain", panel.hdr_gain()),
++                        Uniform::new("niri_panel_peak", panel.peak_luminance),
++                    ],
++                )));
++            } else {
++                warn!("HDR texture shader missing; SDR content will render undimmed");
++            }
++            renderer.set_solid_color_transform(Some(Box::new(move |color| {
++                Color32F::new(
++                    color.r() * sdr_gain,
++                    color.g() * sdr_gain,
++                    color.b() * sdr_gain,
++                    color.a(),
++                )
++            })));
++        }
++        Some(FrameBlend::Pq(lum)) => {
+             let scale = (lum / 10000.) as f32;
+             let program = Shaders::get(renderer).texture_hdr.clone();
+             if let Some(program) = program {
+@@ -187,6 +281,10 @@ pub fn set_frame_blend(renderer: &mut GlesRenderer, reference_luminance: Option<
+                         Uniform::new("niri_linear", 0.0f32),
+                         Uniform::new("niri_linear_scale", 0.0f32),
+                         Uniform::new("niri_linear_to_ref", 0.0f32),
++                        Uniform::new("niri_panel", 0.0f32),
++                        Uniform::new("niri_panel_sdr_gain", 0.0f32),
++                        Uniform::new("niri_panel_hdr_gain", 0.0f32),
++                        Uniform::new("niri_panel_peak", 0.0f32),
+                     ],
+                 )));
+             } else {
+@@ -202,6 +300,22 @@ pub fn set_frame_blend(renderer: &mut GlesRenderer, reference_luminance: Option<
+     }
+ }
+ 
++/// Live headroom of a panel-EDR output (full backlight / user brightness), published by the
++/// backend so the color-management descriptions can tell clients how far HDR can go.
++pub struct PanelHeadroom(pub std::sync::Mutex<f32>);
++
++pub fn set_panel_headroom(output: &smithay::output::Output, headroom: f32) {
++    let data = output.user_data();
++    data.insert_if_missing_threadsafe(|| PanelHeadroom(std::sync::Mutex::new(headroom)));
++    *data.get::<PanelHeadroom>().unwrap().0.lock().unwrap() = headroom;
++}
++
++pub fn panel_headroom(output: &smithay::output::Output) -> Option<f32> {
++    let h = output.user_data().get::<PanelHeadroom>()?;
++    let v = *h.0.lock().unwrap();
++    Some(v)
++}
++
+ /// CPU counterpart of the shaders' `niri_blend`: encodes an electrical sRGB premultiplied
+ /// color into PQ/BT.2020 for the given SDR reference luminance scale (reference / 10000).
+ pub fn srgb_to_pq(color: Color32F, ref_lum_scale: f32) -> Color32F {
+@@ -286,11 +400,13 @@ fn adjust_tex_program_for_content(
+ > {
+     match content {
+         ContentColor::Sdr => None,
+-        ContentColor::BlendSpace => {
++        ContentColor::BlendSpace if !FrameBlendState::is_panel(frame) => {
+             let saved = frame.take_tex_program_override();
+             saved.is_some().then_some(saved)
+         }
+-        ContentColor::Linear { .. } => {
++        // On panel EDR frames PQ content is decoded and tone mapped into the panel space by
++        // the blend shader, like extended-linear content.
++        ContentColor::BlendSpace | ContentColor::Linear { .. } => {
+             let program = Shaders::get_from_frame(frame).texture_hdr.clone();
+             let saved = frame.take_tex_program_override();
+             // Prefer the frame override's program; on SDR frames (no override) fall back to
+diff --git a/src/render_helpers/shader_element.rs b/src/render_helpers/shader_element.rs
+index 87f84d7..8f4975a 100644
+--- a/src/render_helpers/shader_element.rs
++++ b/src/render_helpers/shader_element.rs
+@@ -176,6 +176,10 @@ impl ShaderProgram {
+         additional_uniforms.push(UniformName::new("niri_linear", UniformType::_1f));
+         additional_uniforms.push(UniformName::new("niri_linear_scale", UniformType::_1f));
+         additional_uniforms.push(UniformName::new("niri_linear_to_ref", UniformType::_1f));
++        additional_uniforms.push(UniformName::new("niri_panel", UniformType::_1f));
++        additional_uniforms.push(UniformName::new("niri_panel_sdr_gain", UniformType::_1f));
++        additional_uniforms.push(UniformName::new("niri_panel_hdr_gain", UniformType::_1f));
++        additional_uniforms.push(UniformName::new("niri_panel_peak", UniformType::_1f));
+ 
+         renderer.with_context(move |gl| unsafe {
+             compile_program(gl, &src, &additional_uniforms, texture_uniforms)
+diff --git a/src/render_helpers/shaders/hdr.frag b/src/render_helpers/shaders/hdr.frag
+index 64675e3..7562804 100644
+--- a/src/render_helpers/shaders/hdr.frag
++++ b/src/render_helpers/shaders/hdr.frag
+@@ -15,6 +15,45 @@ uniform float niri_linear;
+ uniform float niri_linear_scale;
+ uniform float niri_linear_to_ref;
+ 
++// Panel EDR (SDR-only built-in panel with backlight headroom, no HDR signalling). The
++// framebuffer holds pure-2.2-gamma values relative to the panel's *current* full-scale
++// luminance, which niri raises above the user's SDR brightness while HDR content is shown.
++//
++// niri_panel: 0 = off, 1 = SDR content, 2 = PQ/BT.2020 content, 3 = extended-linear content.
++// niri_panel_sdr_gain = (SDR white / panel full scale)^(1/2.2): a 2.2-power encode commutes
++// with scaling, so dimming SDR content is a single multiply on its electrical values.
++// niri_panel_hdr_gain scales HDR content luminance so its reference white lands on the
++// user's SDR white. niri_panel_peak = current panel full-scale luminance in cd/m².
++uniform float niri_panel;
++uniform float niri_panel_sdr_gain;
++uniform float niri_panel_hdr_gain;
++uniform float niri_panel_peak;
++
++vec3 niri_pq_eotf(vec3 e) {
++    const float pq_m1 = 0.1593017578125;
++    const float pq_m2 = 78.84375;
++    const float pq_c1 = 0.8359375;
++    const float pq_c2 = 18.8515625;
++    const float pq_c3 = 18.6875;
++    vec3 p = pow(clamp(e, 0.0, 1.0), vec3(1.0 / pq_m2));
++    return pow(max(p - pq_c1, vec3(0.0)) / (pq_c2 - pq_c3 * p), vec3(1.0 / pq_m1));
++}
++
++// BT.709-primaries linear light in cd/m² -> panel electrical value. The brightest channel is
++// soft-clipped into the panel's current peak (hue-preserving), then 2.2-encoded.
++vec3 niri_panel_from_nits(vec3 nits) {
++    vec3 c = max(nits, vec3(0.0));
++    float peak = max(niri_panel_peak, 1.0);
++    float m = max(c.r, max(c.g, c.b));
++    float knee = 0.75 * peak;
++    if (m > knee) {
++        float span = peak - knee;
++        float mapped = knee + span * (1.0 - exp(-(m - knee) / span));
++        c *= mapped / m;
++    }
++    return pow(clamp(c / peak, 0.0, 1.0), vec3(1.0 / 2.2));
++}
++
+ vec3 niri_pq_inv_eotf(vec3 lin) {
+     const float pq_m1 = 0.1593017578125;
+     const float pq_m2 = 78.84375;
+@@ -27,6 +66,29 @@ vec3 niri_pq_inv_eotf(vec3 lin) {
+ 
+ // Premultiplied in, premultiplied out.
+ vec4 niri_blend(vec4 color) {
++    if (niri_panel > 0.5) {
++        if (niri_panel < 1.5)
++            return vec4(color.rgb * niri_panel_sdr_gain, color.a);
++
++        float pa = color.a;
++        vec3 prgb = pa > 0.0 ? color.rgb / pa : color.rgb;
++        // BT.2020 -> BT.709 primaries, linear light, D65 (column-major).
++        const mat3 panel_to_bt709 = mat3(
++            1.660491, -0.124550, -0.018151,
++            -0.587641, 1.132900, -0.100579,
++            -0.072850, -0.008349, 1.118730);
++        vec3 nits;
++        if (niri_panel < 2.5) {
++            nits = panel_to_bt709 * (niri_pq_eotf(prgb) * 10000.0);
++        } else {
++            nits = prgb * (niri_linear_scale * 10000.0);
++            if (niri_linear > 1.5)
++                nits = panel_to_bt709 * nits;
++        }
++        prgb = niri_panel_from_nits(nits * niri_panel_hdr_gain);
++        return vec4(prgb * pa, pa);
++    }
++
+     if (niri_hdr_pq < 0.5 && niri_linear < 0.5)
+         return color;
+ 
+diff --git a/src/render_helpers/shaders/mod.rs b/src/render_helpers/shaders/mod.rs
+index 88f7666..c2c5359 100644
+--- a/src/render_helpers/shaders/mod.rs
++++ b/src/render_helpers/shaders/mod.rs
+@@ -46,6 +46,10 @@ impl Shaders {
+                     UniformName::new("niri_linear", UniformType::_1f),
+                     UniformName::new("niri_linear_scale", UniformType::_1f),
+                     UniformName::new("niri_linear_to_ref", UniformType::_1f),
++                    UniformName::new("niri_panel", UniformType::_1f),
++                    UniformName::new("niri_panel_sdr_gain", UniformType::_1f),
++                    UniformName::new("niri_panel_hdr_gain", UniformType::_1f),
++                    UniformName::new("niri_panel_peak", UniformType::_1f),
+                 ],
+             )
+             .map_err(|err| {
+@@ -120,6 +124,10 @@ impl Shaders {
+                     UniformName::new("niri_linear", UniformType::_1f),
+                     UniformName::new("niri_linear_scale", UniformType::_1f),
+                     UniformName::new("niri_linear_to_ref", UniformType::_1f),
++                    UniformName::new("niri_panel", UniformType::_1f),
++                    UniformName::new("niri_panel_sdr_gain", UniformType::_1f),
++                    UniformName::new("niri_panel_hdr_gain", UniformType::_1f),
++                    UniformName::new("niri_panel_peak", UniformType::_1f),
+                 ],
+             )
+             .map_err(|err| {
+@@ -148,6 +156,10 @@ impl Shaders {
+                     UniformName::new("niri_linear", UniformType::_1f),
+                     UniformName::new("niri_linear_scale", UniformType::_1f),
+                     UniformName::new("niri_linear_to_ref", UniformType::_1f),
++                    UniformName::new("niri_panel", UniformType::_1f),
++                    UniformName::new("niri_panel_sdr_gain", UniformType::_1f),
++                    UniformName::new("niri_panel_hdr_gain", UniformType::_1f),
++                    UniformName::new("niri_panel_peak", UniformType::_1f),
+                 ],
+             )
+             .map_err(|err| {
+@@ -171,6 +183,10 @@ impl Shaders {
+                     UniformName::new("niri_linear", UniformType::_1f),
+                     UniformName::new("niri_linear_scale", UniformType::_1f),
+                     UniformName::new("niri_linear_to_ref", UniformType::_1f),
++                    UniformName::new("niri_panel", UniformType::_1f),
++                    UniformName::new("niri_panel_sdr_gain", UniformType::_1f),
++                    UniformName::new("niri_panel_hdr_gain", UniformType::_1f),
++                    UniformName::new("niri_panel_peak", UniformType::_1f),
+                 ],
+             )
+             .map_err(|err| {
+diff --git a/src/tests/color_management.rs b/src/tests/color_management.rs
+index 377bc08..4d148c7 100644
+--- a/src/tests/color_management.rs
++++ b/src/tests/color_management.rs
+@@ -113,6 +113,7 @@ fn fixture_with_hdr_mode_on() -> Fixture {
+         .user_data()
+         .insert_if_missing(|| OutputHdrCaps {
+             supported: true,
++            panel: false,
+             max_luminance: 800,
+             min_luminance: 100,
+             max_frame_avg_luminance: 600,
+-- 
+2.47.3
+

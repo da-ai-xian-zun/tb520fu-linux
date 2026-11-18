@@ -1,0 +1,99 @@
+From 32812f0691a5db3749b04f4e44b5e9715d4f6fd9 Mon Sep 17 00:00:00 2001
+From: da-ai-xian-zun <163512031+da-ai-xian-zun@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 03:28:06 -0500
+Subject: [PATCH 4/6] ipa: softisp: adjust: Read default gamma, contrast and
+ saturation from tuning
+
+Allow tuning files to set the default gamma, contrast and saturation, so
+that a sensor tuning can match the intended look without requiring every
+application to set these controls. Behaviour is unchanged when the tuning
+file doesn't specify them.
+---
+ src/ipa/softisp/algorithms/adjust.cpp | 28 ++++++++++++++++++++-------
+ src/ipa/softisp/algorithms/adjust.h   |  6 ++++++
+ 2 files changed, 27 insertions(+), 7 deletions(-)
+
+diff --git a/src/ipa/softisp/algorithms/adjust.cpp b/src/ipa/softisp/algorithms/adjust.cpp
+index 56e2cf0..52d2fc1 100644
+--- a/src/ipa/softisp/algorithms/adjust.cpp
++++ b/src/ipa/softisp/algorithms/adjust.cpp
+@@ -8,6 +8,8 @@
+ 
+ #include "adjust.h"
+ 
++#include <algorithm>
++
+ #include <libcamera/base/log.h>
+ #include <libcamera/base/utils.h>
+ 
+@@ -24,24 +26,36 @@ constexpr float kDefaultSaturation = 1.0f;
+ 
+ LOG_DEFINE_CATEGORY(IPASoftIspAdjust)
+ 
+-int Adjust::init(IPAContext &context, [[maybe_unused]] const ValueNode &tuningData)
++int Adjust::init(IPAContext &context, const ValueNode &tuningData)
+ {
++	/*
++	 * The tuning file may override the default gamma, contrast and
++	 * saturation, to match the look of the sensor's vendor tuning.
++	 */
++	gamma_ = std::clamp(tuningData["gamma"].get<float>(kDefaultGamma), 0.1f, 10.0f);
++	contrast_ = tuningData["contrast"].get<float>();
++	if (contrast_)
++		contrast_ = std::clamp(*contrast_, 0.0f, 2.0f);
++	saturation_ = tuningData["saturation"].get<float>();
++	if (saturation_)
++		saturation_ = std::clamp(*saturation_, 0.0f, 2.0f);
++
+ 	context.ctrlMap[&controls::Gamma] =
+-		ControlInfo(0.1f, 10.0f, kDefaultGamma);
++		ControlInfo(0.1f, 10.0f, gamma_);
+ 	context.ctrlMap[&controls::Contrast] =
+-		ControlInfo(0.0f, 2.0f, kDefaultContrast);
++		ControlInfo(0.0f, 2.0f, contrast_.value_or(kDefaultContrast));
+ 	if (context.ccmEnabled)
+ 		context.ctrlMap[&controls::Saturation] =
+-			ControlInfo(0.0f, 2.0f, kDefaultSaturation);
++			ControlInfo(0.0f, 2.0f, saturation_.value_or(kDefaultSaturation));
+ 	return 0;
+ }
+ 
+ int Adjust::configure(IPAContext &context,
+ 		      [[maybe_unused]] const IPAConfigInfo &configInfo)
+ {
+-	context.activeState.knobs.gamma = kDefaultGamma;
+-	context.activeState.knobs.contrast = std::optional<float>();
+-	context.activeState.knobs.saturation = std::optional<float>();
++	context.activeState.knobs.gamma = gamma_;
++	context.activeState.knobs.contrast = contrast_;
++	context.activeState.knobs.saturation = saturation_;
+ 
+ 	return 0;
+ }
+diff --git a/src/ipa/softisp/algorithms/adjust.h b/src/ipa/softisp/algorithms/adjust.h
+index 1acf7cd..8677c70 100644
+--- a/src/ipa/softisp/algorithms/adjust.h
++++ b/src/ipa/softisp/algorithms/adjust.h
+@@ -7,6 +7,8 @@
+ 
+ #pragma once
+ 
++#include <optional>
++
+ #include "libcamera/internal/matrix.h"
+ 
+ #include <libipa/interpolator.h>
+@@ -43,6 +45,10 @@ public:
+ 
+ private:
+ 	void applySaturation(Matrix<float, 3, 3> &ccm, float saturation);
++
++	float gamma_ = kDefaultGamma;
++	std::optional<float> contrast_;
++	std::optional<float> saturation_;
+ };
+ 
+ } /* namespace ipa::softisp::algorithms */
+-- 
+2.47.3
+

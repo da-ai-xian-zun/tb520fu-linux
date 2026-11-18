@@ -1,0 +1,14 @@
+[Unit]
+Description=Initialize Qualcomm ADSP Sensor Hub (QSH) for Lenovo TB520FU
+After=systemd-modules-load.service dbus.service
+Before=iio-sensor-proxy.service
+Conflicts=y700-sns-init.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/qcom-sns/qcom-sns-init
+TimeoutStartSec=90
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

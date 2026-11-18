@@ -1,0 +1,124 @@
+diff --git a/arch/arm/mach-snapdragon/Kconfig b/arch/arm/mach-snapdragon/Kconfig
+index ddded002..00802db1 100644
+--- a/arch/arm/mach-snapdragon/Kconfig
++++ b/arch/arm/mach-snapdragon/Kconfig
+@@ -59,6 +59,15 @@ config QCOM_GENERATE_MBN
+ 	  New platforms can be added to tools/qcom/mkmbn/mkmbn.py if they aren't already
+ 	  supported.
+ 
++config TB520FU_BOOTFLAG
++	bool "TB520FU: one-shot boot selection flag in PMK8550 SDAM2"
++	depends on DM_PMIC && PMIC_QCOM
++	help
++	  Adds the bootflag command. Linux leaves a value in a spare PMIC SDAM
++	  byte to ask for Android on the next boot; the boot menu reads and
++	  clears it. Also bounds the SPMI status wait, so that a transfer
++	  that never completes returns an error instead of hanging the menu.
++
+ choice
+ 	prompt "Qualcomm boot0.h workaround"
+ 	optional
+diff --git a/arch/arm/mach-snapdragon/Makefile b/arch/arm/mach-snapdragon/Makefile
+index 2360b7c6..660e7f3e 100644
+--- a/arch/arm/mach-snapdragon/Makefile
++++ b/arch/arm/mach-snapdragon/Makefile
+@@ -9,6 +9,8 @@ ifeq ($(CONFIG_SPL_BUILD),y)
+ obj-y += board_spl.o
+ else
+ obj-y += board.o
++obj-y += androidboot.o
++obj-$(CONFIG_TB520FU_BOOTFLAG) += bootflag.o
+ obj-$(CONFIG_EFI_HAVE_CAPSULE_SUPPORT) += capsule_update.o
+ endif
+ 
+diff --git a/arch/arm/mach-snapdragon/board.c b/arch/arm/mach-snapdragon/board.c
+index 87adb100..49d78cd5 100644
+--- a/arch/arm/mach-snapdragon/board.c
++++ b/arch/arm/mach-snapdragon/board.c
+@@ -97,8 +97,11 @@ int board_fdt_blob_setup(void **fdtp)
+ 		panic("Internal FDT is invalid and no external FDT was provided! (fdt=%#llx)\n",
+ 		      (phys_addr_t)external_fdt);
+ 
+-	/* Prefer memory information from internal DT if it's present */
+-	if (internal_valid)
++	/*
++	 * TB520FU: ABL fills in /memory, while the internal DT has a placeholder.
++	 * Use ABL's map whenever there is one.
++	 */
++	if (internal_valid && !external_valid)
+ 		ret = qcom_parse_memory(internal_fdt, true);
+ 
+ 	if (ret < 0 && external_valid) {
+diff --git a/drivers/spmi/spmi-msm.c b/drivers/spmi/spmi-msm.c
+index b89dd0b4..b2e2c5ec 100644
+--- a/drivers/spmi/spmi-msm.c
++++ b/drivers/spmi/spmi-msm.c
+@@ -13,6 +13,7 @@
+ #include <asm/io.h>
+ #include <dm/device_compat.h>
+ #include <spmi/spmi.h>
++#include <time.h>
+ 
+ /* PMIC Arbiter configuration registers */
+ #define PMIC_ARB_VERSION 0x0000
+@@ -59,6 +60,15 @@
+ #define SPMI_MAX_SLAVES 16
+ #define SPMI_MAX_PERIPH 256
+ 
++/* TB520FU: give up on a transfer whose status never arrives (Linux waits 100 ms). */
++#define SPMI_STATUS_TIMEOUT_MS	200
++
++static bool spmi_status_timed_out(ulong start)
++{
++	return IS_ENABLED(CONFIG_TB520FU_BOOTFLAG) &&
++	       get_timer(start) > SPMI_STATUS_TIMEOUT_MS;
++}
++
+ #define SPMI_CHANNEL_READ_ONLY	BIT(31)
+ #define SPMI_CHANNEL_VALID	BIT(30)
+ #define SPMI_CHANNEL_MASK	0xffff
+@@ -110,6 +120,7 @@ static int msm_spmi_write(struct udevice *dev, int usid, int pid, int off,
+ 	unsigned channel;
+ 	unsigned int ch_offset;
+ 	uint32_t reg = 0;
++	ulong start;
+ 
+ 	if (usid >= SPMI_MAX_SLAVES)
+ 		return -EIO;
+@@ -162,9 +173,14 @@ static int msm_spmi_write(struct udevice *dev, int usid, int pid, int off,
+ 
+ 	/* Wait till CMD DONE status */
+ 	reg = 0;
++	start = IS_ENABLED(CONFIG_TB520FU_BOOTFLAG) ? get_timer(0) : 0;
+ 	while (!reg) {
+ 		reg = readl(priv->spmi_chnls + ch_offset +
+ 			    SPMI_REG_STATUS);
++		if (!reg && spmi_status_timed_out(start)) {
++			printf("SPMI write timeout.\n");
++			return -ETIMEDOUT;
++		}
+ 	}
+ 
+ 	if (reg ^ SPMI_STATUS_DONE) {
+@@ -181,6 +197,7 @@ static int msm_spmi_read(struct udevice *dev, int usid, int pid, int off)
+ 	unsigned channel;
+ 	unsigned int ch_offset;
+ 	uint32_t reg = 0;
++	ulong start;
+ 
+ 	if (usid >= SPMI_MAX_SLAVES)
+ 		return -EIO;
+@@ -232,8 +249,13 @@ static int msm_spmi_read(struct udevice *dev, int usid, int pid, int off)
+ 
+ 	/* Wait till CMD DONE status */
+ 	reg = 0;
++	start = IS_ENABLED(CONFIG_TB520FU_BOOTFLAG) ? get_timer(0) : 0;
+ 	while (!reg) {
+ 		reg = readl(priv->spmi_obs + ch_offset + SPMI_REG_STATUS);
++		if (!reg && spmi_status_timed_out(start)) {
++			printf("SPMI read timeout.\n");
++			return -ETIMEDOUT;
++		}
+ 	}
+ 
+ 	if (reg ^ SPMI_STATUS_DONE) {

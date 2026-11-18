@@ -1,0 +1,460 @@
+// SPDX-License-Identifier: GPL-3.0-only
+import { Theme, Icons } from "theme.slint";
+import { SectionTitle, Card, CardGap, Divider, RowIconBadge, SwitchRow, SliderRow, SegmentedBar, InlineSegRow, SelectRow, PillButton, TagPill } from "widgets.slint";
+
+component WallpaperTile inherits Rectangle {
+    in property <string> label;
+    in property <brush> swatch-bg;
+    in property <bool> selected: false;
+    callback clicked();
+
+    horizontal-stretch: 1;
+    height: 62px;
+    border-radius: 13px;
+    border-width: root.selected ? 2.5px : 1px;
+    border-color: root.selected ? Theme.accent : Theme.glass-sub-border;
+    background: root.swatch-bg;
+    clip: true;
+
+    Rectangle {
+        y: parent.height - 24px;
+        width: 100%;
+        height: 24px;
+        background: #0b0f189e;
+        Text {
+            text: root.label;
+            font-size: 11.5px;
+            font-weight: root.selected ? 700 : 500;
+            color: #ffffff;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    if root.selected : Rectangle {
+        x: parent.width - 24px;
+        y: 6px;
+        width: 18px;
+        height: 18px;
+        border-radius: 9px;
+        background: Theme.accent;
+        Image {
+            width: 11px;
+            height: 11px;
+            x: 3.5px;
+            y: 3.5px;
+            source: Icons.check;
+            colorize: #ffffff;
+        }
+    }
+
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component AccentDot inherits Rectangle {
+    in property <color> dot-color;
+    in property <bool> selected: false;
+    callback clicked();
+
+    width: 34px;
+    height: 34px;
+    border-radius: 17px;
+    border-width: root.selected ? 2.5px : 0px;
+    border-color: Theme.ink;
+    background: dot-ta.has-hover ? Theme.tile-hover : transparent;
+
+    Rectangle {
+        x: 4px;
+        y: 4px;
+        width: 26px;
+        height: 26px;
+        border-radius: 13px;
+        background: root.dot-color;
+
+        if root.selected : Image {
+            width: 13px;
+            height: 13px;
+            x: 6.5px;
+            y: 6.5px;
+            source: Icons.check;
+            colorize: #ffffff;
+        }
+    }
+
+    dot-ta := TouchArea {
+        width: 42px;
+        height: 42px;
+        x: -4px;
+        y: -4px;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component DisplayPage inherits VerticalLayout {
+    in property <bool> shell-online: true;
+    in property <int> skin-idx: 0;
+    in property <int> accent-idx: 0;
+    in property <string> accent-label: "经典钴蓝";
+    in property <int> wallpaper-preset-idx: 0;
+    in property <string> wallpaper-label: "ZUI 原厂流羽";
+    in-out property <int> brightness: 60;
+    in property <bool> autobright: true;
+    in property <int> hbm-idx: 0;
+    in property <bool> night-light: false;
+    in property <bool> reading-mode: false;
+    in property <bool> dsi-hdr: true;
+    in property <bool> high-refresh: true;
+    in property <bool> auto-rotate: true;
+    in property <string> presets-label: "33% · 50% · 67% · 100%";
+    in property <int> scale-idx: 2;
+    in property <string> scale-value-text: "2.00×";
+    in property <string> logical-res-text: "1472×920";
+    in property <bool> ext-connected: false;
+    in property <string> ext-name: "";
+    in property <bool> ext-enabled: true;
+    in property <string> ext-mode-label: "";
+    in property <int> ext-pos-idx: 2;
+    in property <string> pulse-tag: "";
+
+    callback change-skin(int);
+    callback change-accent(int);
+    callback select-wallpaper-preset(int);
+    callback open-local-wallpaper-picker();
+    callback open-custom-wallpaper-modal();
+    callback change-brightness(int);
+    callback toggle-autobright(bool);
+    callback change-hbm(int);
+    callback toggle-night-light(bool);
+    callback toggle-reading-mode(bool);
+    callback toggle-dsi-hdr(bool);
+    callback toggle-high-refresh(bool);
+    callback toggle-auto-rotate(bool);
+    callback open-presets-picker();
+    callback change-scale(int);
+    callback toggle-ext-enabled(bool);
+    callback open-ext-mode-picker();
+    callback change-ext-pos(int);
+
+    spacing: 0px;
+
+    SectionTitle { text: "外观与壁纸"; first: true; }
+    Card {
+        pulse: root.pulse-tag == "skin" || root.pulse-tag == "accent" || root.pulse-tag == "wallpaper";
+        VerticalLayout {
+            InlineSegRow {
+                has-icon: true;
+                icon: Icons.palette;
+                title: "界面外观";
+                labels: ["深色玻璃", "浅色暖纸"];
+                selected: root.skin-idx;
+                changed(i) => { root.change-skin(i); }
+            }
+            Divider {}
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 10px;
+                padding-bottom: 10px;
+                spacing: 12px;
+
+                VerticalLayout {
+                    alignment: center;
+                    RowIconBadge { icon: Icons.palette; active: true; }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    Text { text: "主题强调色"; font-size: 14.5px; font-weight: 600; color: Theme.ink; }
+                    Text { text: root.accent-label; font-size: 12px; color: Theme.sub; wrap: word-wrap; }
+                }
+
+                HorizontalLayout {
+                    alignment: center;
+                    spacing: 6px;
+                    AccentDot { dot-color: #2e6bf6; selected: root.accent-idx == 0; clicked => { root.change-accent(0); } }
+                    AccentDot { dot-color: #6366f1; selected: root.accent-idx == 1; clicked => { root.change-accent(1); } }
+                    AccentDot { dot-color: #0d9488; selected: root.accent-idx == 2; clicked => { root.change-accent(2); } }
+                    AccentDot { dot-color: #d97706; selected: root.accent-idx == 3; clicked => { root.change-accent(3); } }
+                    AccentDot { dot-color: #e11d48; selected: root.accent-idx == 4; clicked => { root.change-accent(4); } }
+                    AccentDot { dot-color: #059669; selected: root.accent-idx == 5; clicked => { root.change-accent(5); } }
+                }
+            }
+            Divider {}
+            VerticalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 11px;
+                padding-bottom: 14px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    spacing: 12px;
+                    VerticalLayout {
+                        alignment: center;
+                        RowIconBadge { icon: Icons.image; }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        horizontal-stretch: 1;
+                        Text { text: "壁纸"; font-size: 14.5px; font-weight: 600; color: Theme.ink; }
+                        Text {
+                            text: root.wallpaper-label;
+                            font-size: 12px;
+                            color: Theme.sub;
+                            wrap: word-wrap;
+                        }
+                    }
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 8px;
+                        PillButton {
+                            text: "图库…";
+                            clicked => { root.open-local-wallpaper-picker(); }
+                        }
+                        PillButton {
+                            text: "路径…";
+                            clicked => { root.open-custom-wallpaper-modal(); }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    WallpaperTile {
+                        label: "原厂流羽";
+                        swatch-bg: @linear-gradient(135deg, #8b95a5 0%, #e59858 55%, #5c7694 100%);
+                        selected: root.wallpaper-preset-idx == 0;
+                        clicked => { root.select-wallpaper-preset(0); }
+                    }
+                    WallpaperTile {
+                        label: "流羽暖金";
+                        swatch-bg: @linear-gradient(135deg, #a8b0bd 0%, #f5a560 52%, #7488a2 100%);
+                        selected: root.wallpaper-preset-idx == 1;
+                        clicked => { root.select-wallpaper-preset(1); }
+                    }
+                    WallpaperTile {
+                        label: "极光青翠";
+                        swatch-bg: @linear-gradient(135deg, #0a1628 0%, #10b994 50%, #2298e8 100%);
+                        selected: root.wallpaper-preset-idx == 2;
+                        clicked => { root.select-wallpaper-preset(2); }
+                    }
+                    WallpaperTile {
+                        label: "暮霞星云";
+                        swatch-bg: @linear-gradient(135deg, #16102c 0%, #704eeb 48%, #e14876 100%);
+                        selected: root.wallpaper-preset-idx == 3;
+                        clicked => { root.select-wallpaper-preset(3); }
+                    }
+                    WallpaperTile {
+                        label: "云山素雪";
+                        swatch-bg: @linear-gradient(135deg, #dce5f4 0%, #a8c6f8 50%, #cec8f4 100%);
+                        selected: root.wallpaper-preset-idx == 4;
+                        clicked => { root.select-wallpaper-preset(4); }
+                    }
+                }
+            }
+        }
+    }
+
+    SectionTitle { text: "亮度"; }
+    Card {
+        pulse: root.pulse-tag == "bright" || root.pulse-tag == "hbm";
+        VerticalLayout {
+            SliderRow {
+                has-icon: true;
+                icon: Icons.sun;
+                title: "屏幕亮度";
+                minimum: 5;
+                maximum: 100;
+                value <=> root.brightness;
+                changed(v) => { root.change-brightness(v); }
+            }
+            Divider {}
+            SwitchRow {
+                title: "自动调节亮度";
+                subtitle: "根据环境光线平滑调节屏幕亮度";
+                checked: root.autobright;
+                toggled(v) => { root.toggle-autobright(v); }
+            }
+            Divider {}
+            VerticalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 10px;
+                padding-bottom: 14px;
+                spacing: 8px;
+                HorizontalLayout {
+                    spacing: 12px;
+                    VerticalLayout {
+                        spacing: 2px;
+                        horizontal-stretch: 1;
+                        Text { text: "户外高亮模式"; font-size: 14.5px; font-weight: 600; color: Theme.ink; }
+                        Text { text: "强光环境下提升屏幕最高亮度"; font-size: 12px; color: Theme.sub; }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: root.hbm-idx == 0 ? "关闭" : (root.hbm-idx == 1 ? "高亮" : "超高亮");
+                            font-size: 13.5px;
+                            color: Theme.sub;
+                        }
+                    }
+                }
+                SegmentedBar {
+                    labels: ["关闭", "高亮", "超高亮"];
+                    selected: root.hbm-idx;
+                    changed(i) => { root.change-hbm(i); }
+                }
+            }
+        }
+    }
+
+    SectionTitle { text: "显示效果与刷新率"; }
+    Card {
+        pulse: root.pulse-tag == "hdr" || root.pulse-tag == "eyecare" || root.pulse-tag == "reading" || root.pulse-tag == "hires" || root.pulse-tag == "autorot";
+        VerticalLayout {
+            SwitchRow {
+                has-icon: true;
+                icon: Icons.sun;
+                title: "HDR 高动态范围";
+                subtitle: "全屏播放 HDR 视频时自动激发峰值亮度";
+                checked: root.dsi-hdr;
+                toggled(v) => { root.toggle-dsi-hdr(v); }
+            }
+            Divider {}
+            SwitchRow {
+                has-icon: true;
+                icon: Icons.eye;
+                title: "护眼模式";
+                subtitle: "柔和暖色调，减少蓝光刺激";
+                checked: root.night-light;
+                enabled: root.shell-online;
+                toggled(v) => { root.toggle-night-light(v); }
+            }
+            Divider {}
+            SwitchRow {
+                has-icon: true;
+                icon: Icons.book;
+                title: "阅读模式";
+                subtitle: "类纸灰阶显示，适合长文阅读";
+                checked: root.reading-mode;
+                enabled: root.shell-online;
+                toggled(v) => { root.toggle-reading-mode(v); }
+            }
+            Divider {}
+            SwitchRow {
+                has-icon: true;
+                icon: Icons.hz;
+                title: "高刷新率";
+                subtitle: "最高 120Hz 流畅显示，关闭为 60Hz";
+                checked: root.high-refresh;
+                enabled: root.shell-online;
+                toggled(v) => { root.toggle-high-refresh(v); }
+            }
+            Divider {}
+            SwitchRow {
+                has-icon: true;
+                icon: Icons.rotate;
+                title: "自动旋转屏幕";
+                checked: root.auto-rotate;
+                enabled: root.shell-online;
+                toggled(v) => { root.toggle-auto-rotate(v); }
+            }
+        }
+    }
+
+    SectionTitle { text: "分栏、缩放与外接显示"; }
+    Card {
+        pulse: root.pulse-tag == "presets" || root.pulse-tag == "scale" || root.pulse-tag == "ext";
+        VerticalLayout {
+            SelectRow {
+                has-icon: true;
+                icon: Icons.scale;
+                title: "分栏宽度预设";
+                value-text: root.presets-label;
+                open-picker => { root.open-presets-picker(); }
+            }
+            Divider {}
+            VerticalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 10px;
+                padding-bottom: 14px;
+                spacing: 9px;
+                HorizontalLayout {
+                    spacing: 12px;
+                    VerticalLayout { alignment: center; RowIconBadge { icon: Icons.display; } }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        horizontal-stretch: 1;
+                        Text { text: "显示缩放"; font-size: 14.5px; font-weight: 600; color: Theme.ink; }
+                        Text {
+                            text: "逻辑分辨率 " + root.logical-res-text;
+                            font-size: 12px;
+                            color: Theme.sub;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Text { text: root.scale-value-text; font-size: 13.5px; color: Theme.sub; }
+                    }
+                }
+                SegmentedBar {
+                    labels: ["1.50×", "1.75×", "2.00×", "2.25×"];
+                    selected: root.scale-idx;
+                    changed(i) => { root.change-scale(i); }
+                }
+            }
+            Divider {}
+            if !root.ext-connected : HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 11px;
+                padding-bottom: 11px;
+                spacing: 12px;
+                VerticalLayout { alignment: center; RowIconBadge { icon: Icons.monitor; } }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    Text { text: "外接显示器"; font-size: 14.5px; font-weight: 600; color: Theme.ink; }
+                    Text { text: "通过 USB-C 连接外接屏幕"; font-size: 12px; color: Theme.sub; }
+                }
+                VerticalLayout { alignment: center; TagPill { text: "未连接"; } }
+            }
+            if root.ext-connected : VerticalLayout {
+                SwitchRow {
+                    has-icon: true;
+                    icon: Icons.monitor;
+                    title: "外接显示器：" + root.ext-name;
+                    checked: root.ext-enabled;
+                    toggled(v) => { root.toggle-ext-enabled(v); }
+                }
+                if root.ext-enabled : VerticalLayout {
+                    Divider {}
+                    SelectRow {
+                        title: "分辨率与刷新率";
+                        value-text: root.ext-mode-label;
+                        open-picker => { root.open-ext-mode-picker(); }
+                    }
+                    Divider {}
+                    InlineSegRow {
+                        title: "排列位置";
+                        labels: ["左侧", "上方", "右侧"];
+                        selected: root.ext-pos-idx;
+                        changed(i) => { root.change-ext-pos(i); }
+                    }
+                }
+            }
+        }
+    }
+    CardGap {}
+}

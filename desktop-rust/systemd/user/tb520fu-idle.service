@@ -1,0 +1,14 @@
+[Unit]
+Description=TB520FU Idle Lock Manager (5 min lock -> Standby Companion on AC / DPMS off on battery; NO suspend)
+PartOf=graphical-session.target
+After=graphical-session.target tb520fu-shell.service
+ConditionUser=!@system
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/swayidle -w timeout 300 'loginctl lock-session' before-sleep 'loginctl lock-session'
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target niri.service

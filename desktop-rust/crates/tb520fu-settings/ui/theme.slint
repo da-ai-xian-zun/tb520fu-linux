@@ -1,0 +1,161 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
+export struct WifiRow {
+    ssid: string,
+    subtitle: string,
+    strength: int,
+    secure: bool,
+    saved: bool,
+}
+
+export struct BtRow {
+    path: string,
+    mac: string,
+    name: string,
+    subtitle: string,
+    is-pen: bool,
+    connected: bool,
+    has-battery: bool,
+    battery-text: string,
+}
+
+export struct AudioRow {
+    id: int,
+    name: string,
+    subtitle: string,
+    is-bt: bool,
+    active: bool,
+}
+
+export struct SuspendRow {
+    started: string,
+    duration: string,
+    delta-cap: string,
+    avg-power: string,
+}
+
+export struct NotifAppRow {
+    name: string,
+    enabled: bool,
+}
+
+export struct SearchHit {
+    page-id: string,
+    section-tag: string,
+    title: string,
+    page-label: string,
+}
+
+export global Icons {
+    out property <image> wifi: @image-url("icons/wifi.svg");
+    out property <image> bt: @image-url("icons/bt.svg");
+    out property <image> display: @image-url("icons/display.svg");
+    out property <image> sun: @image-url("icons/sun.svg");
+    out property <image> sound: @image-url("icons/sound.svg");
+    out property <image> battery: @image-url("icons/battery.svg");
+    out property <image> pen: @image-url("icons/pen.svg");
+    out property <image> gear: @image-url("icons/gear.svg");
+    out property <image> search: @image-url("icons/search.svg");
+    out property <image> back: @image-url("icons/back.svg");
+    out property <image> chev-down: @image-url("icons/chev-down.svg");
+    out property <image> chev-right: @image-url("icons/chev-right.svg");
+    out property <image> check: @image-url("icons/check.svg");
+    out property <image> lock: @image-url("icons/lock.svg");
+    out property <image> eye: @image-url("icons/eye.svg");
+    out property <image> book: @image-url("icons/book.svg");
+    out property <image> hz: @image-url("icons/hz.svg");
+    out property <image> rotate: @image-url("icons/rotate.svg");
+    out property <image> scale: @image-url("icons/scale.svg");
+    out property <image> monitor: @image-url("icons/monitor.svg");
+    out property <image> mic: @image-url("icons/mic.svg");
+    out property <image> headphone: @image-url("icons/headphone.svg");
+    out property <image> clock: @image-url("icons/clock.svg");
+    out property <image> moon: @image-url("icons/moon.svg");
+    out property <image> globe: @image-url("icons/globe.svg");
+    out property <image> touchpad: @image-url("icons/touchpad.svg");
+    out property <image> tablet: @image-url("icons/tablet.svg");
+    out property <image> palette: @image-url("icons/palette.svg");
+    out property <image> bell: @image-url("icons/bell.svg");
+    out property <image> image: @image-url("icons/image.svg");
+    out property <image> keyboard: @image-url("icons/keyboard.svg");
+    out property <image> plane: @image-url("icons/plane.svg");
+    out property <image> apps: @image-url("icons/apps.svg");
+    out property <image> key: @image-url("icons/key.svg");
+    out property <image> external: @image-url("icons/external.svg");
+}
+
+export global Theme {
+    in-out property <bool> light: false;
+    // 0: Blue (#2e6bf6), 1: Indigo (#6366f1), 2: Teal (#0d9488), 3: Amber (#d97706), 4: Rose (#e11d48), 5: Emerald (#059669)
+    in-out property <int> accent-idx: 0;
+
+    out property <color> accent:
+        accent-idx == 1 ? #6366f1 :
+        accent-idx == 2 ? #0d9488 :
+        accent-idx == 3 ? #d97706 :
+        accent-idx == 4 ? #e11d48 :
+        accent-idx == 5 ? #059669 : #2e6bf6;
+
+    out property <color> accent-hover:
+        accent-idx == 1 ? #7577f5 :
+        accent-idx == 2 ? #14b8a6 :
+        accent-idx == 3 ? #f59e0b :
+        accent-idx == 4 ? #f43f5e :
+        accent-idx == 5 ? #10b981 : #3b78ff;
+
+    out property <color> accent-soft:
+        accent-idx == 1 ? (light ? #6366f124 : #6366f13a) :
+        accent-idx == 2 ? (light ? #0d948824 : #0d94883a) :
+        accent-idx == 3 ? (light ? #d9770624 : #d977063a) :
+        accent-idx == 4 ? (light ? #e11d4824 : #e11d483a) :
+        accent-idx == 5 ? (light ? #05966924 : #0596693a) :
+                          (light ? #2e6bf624 : #2e6bf638);
+
+    out property <color> accent-ink:
+        accent-idx == 1 ? (light ? #4f46e5 : #a5b4fc) :
+        accent-idx == 2 ? (light ? #0f766e : #5eead4) :
+        accent-idx == 3 ? (light ? #b45309 : #fbbf24) :
+        accent-idx == 4 ? (light ? #be123c : #fda4af) :
+        accent-idx == 5 ? (light ? #047857 : #6ee7b7) :
+                          (light ? #1d56d8 : #9ec0ff);
+
+    // Opaque ambient window backdrop (avoids full-window compositor blur so Niri stays locked at 120Hz)
+    out property <color> win-bg: light ? #ebf0f9 : #141923;
+    out property <color> win-bg-top: light ? #f1f5fc : #171d2b;
+    out property <color> win-bg-bot: light ? #e3ebf7 : #111620;
+
+    // Sculpted Liquid Glass tokens for inner panels, cards, pills, and controls
+    out property <color> side-bg: light ? #f7faffc8 : #1d2434b8;
+    out property <color> side-bg-bot: light ? #eef3fcc0 : #161c29b8;
+    out property <color> modal-bg: light ? #f8fbfff5 : #1e2536f2;
+    out property <color> modal-bg-bot: light ? #edf3fcf5 : #171d2bf5;
+
+    out property <color> card-bg: light ? #ffffffcf : #ffffff13;
+    out property <color> card-hover: light ? #ffffffeb : #ffffff1d;
+    out property <color> card-glass-top: light ? #fffffff0 : #ffffff21;
+    out property <color> card-glass-mid: light ? #f9fbffcf : #ffffff11;
+    out property <color> card-glass-bot: light ? #f2f7ffde : #ffffff17;
+    out property <color> card-shadow: light ? #0f1e3c12 : #04070e40;
+
+    out property <color> glass-border: light ? #ffffffeb : #ffffff26;
+    out property <color> glass-specular: light ? #ffffffff : #ffffff48;
+    out property <color> glass-sub-top: light ? #ffffffde : #ffffff1f;
+    out property <color> glass-sub-bot: light ? #eef3fccc : #ffffff11;
+    out property <color> glass-sub-hover: light ? #fffffff7 : #ffffff2c;
+    out property <color> glass-sub-border: light ? #0f172a17 : #ffffff26;
+    out property <color> glass-well-bg: light ? #0f182b0f : #06091142;
+    out property <color> glass-well-border: light ? #0f182b16 : #ffffff1a;
+
+    out property <color> tile-bg: light ? #0f142010 : #ffffff16;
+    out property <color> tile-hover: light ? #0f14201c : #ffffff24;
+    out property <color> line: light ? #0f172a12 : #ffffff16;
+    out property <color> rim: light ? #0f172a22 : #ffffff2e;
+    out property <color> slider-track: light ? #0f172a1e : #ffffff26;
+
+    out property <color> ink: light ? #101522 : #f4f7fc;
+    out property <color> ink-muted: light ? #101522cf : #f4f7fcd8;
+    out property <color> sub: light ? #1e293bb0 : #dce6faa8;
+    out property <color> green: light ? #047857 : #34d399;
+    out property <color> green-soft: light ? #05966920 : #10b9812b;
+    out property <color> danger: light ? #dc2626 : #f87171;
+}

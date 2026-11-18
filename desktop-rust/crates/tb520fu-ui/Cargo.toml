@@ -1,0 +1,24 @@
+[package]
+name = "tb520fu-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
+ash.workspace = true
+tiny-skia.workspace = true
+cosmic-text.workspace = true
+svgtypes.workspace = true
+png.workspace = true
+zune-jpeg.workspace = true
+wayland-backend.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true
+wayland-protocols-wlr.workspace = true
+wayland-protocols-misc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+naga = { version = "23", default-features = false, features = ["wgsl-in", "spv-out"] }

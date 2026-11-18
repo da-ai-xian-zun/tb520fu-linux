@@ -1,0 +1,81 @@
+#!/bin/sh
+set -eu
+
+HEXAGONRPCD=/usr/bin/hexagonrpcd
+ROOT=/usr/share/qcom/sm8650/Lenovo/tb520fu
+PERSIST=/var/lib/qcom-sns/persist
+REGISTRY="$PERSIST/sensors/registry/registry"
+LOGDIR=/var/log/qcom-sns
+LOG="$LOGDIR/hexagonrpcd-init.log"
+
+mkdir -p "$REGISTRY" "$LOGDIR"
+
+# 1. Wait for ADSP remoteproc0 and disable SSR recovery so an ADSP fault never resets the tablet.
+waited=0
+while [ ! -e /sys/class/remoteproc/remoteproc0/recovery ] && [ "$waited" -lt 30 ]; do
+  sleep 1
+  waited=$((waited + 1))
+done
+if [ -w /sys/class/remoteproc/remoteproc0/recovery ]; then
+  echo disabled > /sys/class/remoteproc/remoteproc0/recovery
+fi
+
+# 2. Ensure PMIC sensor rails (ldob1 1.8V, ldob2 3.008V, ldob9 3.0V, ldob14 3.2V)
+#    are voted ON in RPMH_ACTIVE_ONLY_STATE before ADSP QSH discovers lsm6dso/tcs3408.
+modprobe tb520fu_sensor_rails || true
+
+# 3. Clear any interrupted partial persist registry (<200 files); preserve full calibrated registry.
+pre_count=$(find "$REGISTRY" -type f 2>/dev/null | wc -l)
+if [ "$pre_count" -gt 0 ] && [ "$pre_count" -lt 200 ]; then
+  echo "$(date -Is) clearing partial registry_files=$pre_count before init" >>"$LOG"
+  rm -rf "$PERSIST/sensors/registry"
+  mkdir -p "$REGISTRY"
+fi
+
+# 4. Load fastrpc explicitly (kept blacklisted for udev so rails + recovery=disabled always happen first).
+modprobe fastrpc
+
+waited=0
+while [ ! -e /dev/fastrpc-adsp ] && [ "$waited" -lt 30 ]; do
+  sleep 1
+  waited=$((waited + 1))
+done
+if [ ! -e /dev/fastrpc-adsp ]; then
+  echo "$(date -Is) missing /dev/fastrpc-adsp after ${waited}s" >>"$LOG"
+  exit 1
+fi
+
+udevadm settle --timeout=10 || true
+
+if [ ! -x "$HEXAGONRPCD" ]; then
+  echo "$(date -Is) missing executable $HEXAGONRPCD" >>"$LOG"
+  exit 1
+fi
+
+if [ ! -d "$ROOT/sensors/registry" ] || [ ! -d "$ROOT/sensors/config" ]; then
+  echo "$(date -Is) missing TB520FU sensor data under $ROOT" >>"$LOG"
+  exit 1
+fi
+
+# 5. Start persistent hexagonrpcd for ADSP Sensors PD.
+systemctl start qcom-sns-hexagonrpcd.service
+
+# 6. Wait for persist registry population (>=200 files) + ADSP QSH sensor discovery settle.
+waited=0
+count=$(find "$REGISTRY" -type f 2>/dev/null | wc -l)
+while [ "$count" -lt 200 ] && [ "$waited" -lt 45 ]; do
+  sleep 1
+  waited=$((waited + 1))
+  count=$(find "$REGISTRY" -type f 2>/dev/null | wc -l)
+done
+
+if [ "$count" -lt 200 ]; then
+  echo "$(date -Is) registry_files=$count after ${waited}s" >>"$LOG"
+  exit 1
+fi
+
+# Allow ADSP sns_registry + sns_lsm6dso / sns_tcs3408 hardware discovery to complete
+# before iio-sensor-proxy opens QRTR SSC streams.
+sleep 5
+echo "$(date -Is) qcom-sns-init ready (registry_files=$count)" >>"$LOG"
+exit 0

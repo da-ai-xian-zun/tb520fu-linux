@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: GPL-2.0
+/* U-Boot only: no clocks on the framebuffer, ABL left it running. */
+/ {
+	chosen {
+		/delete-property/ stdout-path;
+	};
+
+	/* The hall sensor is a TLMM GPIO, and TLMM stays off (see below). */
+	/delete-node/ hall-keys;
+};
+
+/* Some TLMM pins are owned by secure firmware; the menu has no use for any of them. */
+&tlmm {
+	status = "disabled";
+};
+
+&framebuffer0 {
+	/delete-property/ clocks;
+	/delete-property/ power-domains;
+};

@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: CC0-1.0
+# TB520FU front camera (GalaxyCore GC13A2, fixed focus), libcamera softisp >= 0.8.
+# CCMs: parsed from the Android tuning file com.qti.tuned.lapis_lce_gc13a2_front.bin.
+# White-balance bias folded into the CCMs: R x1.05, B x0.99 (the softisp grey-world
+# AWB has no bias knob; CCM x diag(r, 1, b) is equivalent).
+# Calibrated 2026-11-18 under the ceiling light against the white wall in the Android
+# reference shot taken with the stock Android camera (Android wall R/G 1.059 B/G 0.967; here
+# edge wall 0.98/0.94, centre 1.01/0.96). A paper facing the camera is lit by the screen
+# and is not a usable reference. The centre/edge difference is lens colour shading; no
+# shading correction yet. Black level 4096 turned the shadows green, 3800 kept.
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+      blackLevel: 3800
+  - Awb:
+  - Ccm:
+      ccms:
+        - ct: 3000
+          ccm: [ 1.562, -0.4681, -0.0193,
+                 -0.2071, 1.3973, -0.1981,
+                 0.0221, -0.6405, 1.6033 ]
+        - ct: 4000
+          ccm: [ 1.6444, -0.5434, -0.0225,
+                 -0.2403, 1.4613, -0.23,
+                 0.0256, -0.7436, 1.702 ]
+        - ct: 5000
+          ccm: [ 1.7574, -0.5809, -0.0918,
+                 -0.2709, 1.2696, -0.0115,
+                 0.0359, -0.8695, 1.8169 ]
+        - ct: 6500
+          ccm: [ 1.4728, -0.4328, 0.0297,
+                 -0.1589, 1.2276, -0.0755,
+                 0.0276, -0.5253, 1.484 ]
+  - Adjust:
+      gamma: 2.2
+      contrast: 1.2
+      saturation: 1.2
+  - Agc:
+      # Upper bound only: libipa's default lower bound (top 2 % >= 0.5) drove the
+      # gain to 8x and overexposed every indoor scene on this softisp pipeline.
+      AeConstraintMode:
+        Normal:
+          upper:
+            qLo: 0.98
+            qHi: 1.0
+            yTarget: 0.8
+      relativeLuminanceTarget: 0.2
+...

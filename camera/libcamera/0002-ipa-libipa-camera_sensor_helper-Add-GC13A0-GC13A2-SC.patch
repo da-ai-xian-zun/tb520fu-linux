@@ -1,0 +1,82 @@
+From c8974499a0240344144a44332d44667aad456786 Mon Sep 17 00:00:00 2001
+From: da-ai-xian-zun <163512031+da-ai-xian-zun@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 03:25:25 -0500
+Subject: [PATCH 2/6] ipa: libipa: camera_sensor_helper: Add GC13A0, GC13A2,
+ SC202CS and SC820CS
+
+These sensors are used on the Lenovo Yoga Pad Pro 12.7 (TB520FU) and the
+Legion Y700 tablets. Their drivers expose the analogue gain code linearly
+with 1024 meaning unity gain.
+---
+ src/ipa/libipa/camera_sensor_helper.cpp | 48 +++++++++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+index 608937d..20aca4d 100644
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -530,6 +530,30 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("gc05a2", CameraSensorHelperGc05a2)
+ 
++class CameraSensorHelperGc13a0 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperGc13a0()
++	{
++		/* The driver exposes the gain code as 1024 = 1x. */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 1024 };
++		exposureMargin_ = 16;
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("gc13a0", CameraSensorHelperGc13a0)
++
++class CameraSensorHelperGc13a2 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperGc13a2()
++	{
++		/* The driver exposes the gain code as 1024 = 1x. */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 1024 };
++		exposureMargin_ = 16;
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("gc13a2", CameraSensorHelperGc13a2)
++
+ class CameraSensorHelperGc08a3 : public CameraSensorHelper
+ {
+ public:
+@@ -981,6 +1005,30 @@ REGISTER_CAMERA_SENSOR_HELPER("vd56g3", CameraSensorHelperVd56g3)
+ 
+ } /* namespace */
+ 
++class CameraSensorHelperSc202cs : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperSc202cs()
++	{
++		/* The driver exposes the gain code as 1024 = 1x. */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 1024 };
++		exposureMargin_ = 6;
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("sc202cs", CameraSensorHelperSc202cs)
++
++class CameraSensorHelperSc820cs : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperSc820cs()
++	{
++		/* The driver exposes the gain code as 1024 = 1x. */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 1024 };
++		exposureMargin_ = 6;
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("sc820cs", CameraSensorHelperSc820cs)
++
+ #endif /* __DOXYGEN__ */
+ 
+ } /* namespace ipa */
+-- 
+2.47.3
+

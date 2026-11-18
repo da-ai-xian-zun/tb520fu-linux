@@ -1,0 +1,59 @@
+#!/bin/sh
+# 开机标记：让 U-Boot 菜单下一次直接进安卓（只生效一次）。
+#
+# 标记放在 PMK8550 SDAM2 的一个空闲字节里（寄存器 0x7150），断电重启都不丢。
+# U-Boot 开机读到约定值就清零并进安卓，见 boot-switch/DESIGN.md。
+# 寄存器地址和约定值必须和 uboot-port/tb520fu.env 里的一致。
+#
+# 用法（要 root）：
+#   tb520fu-bootflag status          只读，打印当前值
+#   tb520fu-bootflag android         写入“下次进安卓”，不重启
+#   tb520fu-bootflag fastboot        写入“下次进 Fastboot”，不重启（需 bootflag2 U-Boot）
+#   tb520fu-bootflag clear           清零
+#   tb520fu-bootflag reboot-android  写入并立即重启进安卓
+#   tb520fu-bootflag poke 0xNN [0xOFF] 实验用：往指定字节写任意值（默认本标记字节）
+set -eu
+
+NV=/sys/bus/nvmem/devices/spmi_sdam0/nvmem
+OFF=$((0x50))        # SDAM2 内的寄存器偏移，对应 SPMI 地址 0x7150
+MAGIC=$((0xa5))
+MAGIC_FB=$((0xa6))
+
+node=$(readlink -f /sys/bus/nvmem/devices/spmi_sdam0/of_node 2>/dev/null || true)
+case "$node" in
+*/pmic@0/nvram@7100) ;;
+*) echo "spmi_sdam0 不是 PMK8550 SDAM2（$node），不动它" >&2; exit 1 ;;
+esac
+
+rd() { dd if="$NV" bs=1 skip="$1" count=1 2>/dev/null | od -A n -t u1 | tr -d ' \n'; }
+wr() {
+	# shellcheck disable=SC2059
+	printf "$(printf '\\%03o' "$2")" | dd of="$NV" bs=1 seek="$1" count=1 conv=notrunc 2>/dev/null
+	got=$(rd "$1")
+	[ "$got" = "$2" ] || { echo "写 $2 到偏移 $1 后读回 $got" >&2; exit 1; }
+}
+range_ok() { [ "$1" -ge $((0x40)) ] && [ "$1" -le $((0x7f)) ]; }
+
+case "${1:-status}" in
+status)
+	v=$(rd "$OFF")
+	printf '0x71%02x = 0x%02x' "$OFF" "$v"
+	if [ "$v" = "$MAGIC" ]; then echo '（下次开机进安卓）'
+	elif [ "$v" = "$MAGIC_FB" ]; then echo '（下次开机进 Fastboot）'
+	else echo; fi
+	;;
+android) wr "$OFF" "$MAGIC" ;;
+fastboot) wr "$OFF" "$MAGIC_FB" ;;
+clear) wr "$OFF" 0 ;;
+reboot-android)
+	wr "$OFF" "$MAGIC"
+	exec systemctl reboot
+	;;
+poke)
+	val=$(($2)); off=$((${3:-$OFF}))
+	range_ok "$off" || { echo "偏移超出 0x40–0x7f" >&2; exit 1; }
+	wr "$off" "$val"
+	printf '0x71%02x = 0x%02x\n' "$off" "$val"
+	;;
+*) sed -n '2,14p' "$0" >&2; exit 2 ;;
+esac

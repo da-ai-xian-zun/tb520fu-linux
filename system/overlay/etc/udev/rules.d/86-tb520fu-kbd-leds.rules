@@ -1,0 +1,3 @@
+# TB520FU keyboard: let the desktop user drive the mute and mic-mute LEDs
+# (GNOME does not; tb520fu-mute-led.service mirrors the PipeWire mute state).
+ACTION=="add", SUBSYSTEM=="leds", KERNEL=="input*::mute|input*::misc", ATTRS{name}=="Lenovo Keyboard Pack For Yoga Tab", RUN+="/bin/sh -c 'chgrp users /sys%p/brightness && chmod g+w /sys%p/brightness'"

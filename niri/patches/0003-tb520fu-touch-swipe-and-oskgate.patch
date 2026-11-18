@@ -1,0 +1,648 @@
+From eb6543dea40cd727686a4341179decb082a723b9 Mon Sep 17 00:00:00 2001
+From: da-ai-xian-zun <163512031+da-ai-xian-zun@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 01:48:40 -0500
+Subject: [PATCH] tb520fu: touch-swipe-and-oskgate
+
+---
+ src/input/mod.rs         |  11 +-
+ src/input/touch_gate.rs  | 210 ++++++++++++++++++++++++++++++++++
+ src/input/touch_pinch.rs | 237 ++++++++++++++++++++++++++++++---------
+ src/niri.rs              |   2 +
+ 4 files changed, 403 insertions(+), 57 deletions(-)
+ create mode 100644 src/input/touch_gate.rs
+
+diff --git a/src/input/mod.rs b/src/input/mod.rs
+index c0b576dc..6c8d275f 100644
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -63,6 +63,7 @@ pub mod scroll_swipe_gesture;
+ pub mod scroll_tracker;
+ pub mod spatial_movement_grab;
+ pub mod swipe_tracker;
++pub mod touch_gate;
+ pub mod touch_overview_grab;
+ pub mod touch_pinch;
+ pub mod touch_resize_grab;
+@@ -415,6 +416,7 @@ impl State {
+         }
+ 
+         if pressed {
++            self.niri.touch_gate.on_hw_key();
+             self.hide_cursor_if_needed();
+         }
+ 
+@@ -4160,14 +4162,18 @@ impl State {
+         };
+         let slot = evt.slot();
+ 
+-        // TB520FU: multi-finger pinch -> overview.
++        // TB520FU: multi-finger pinch / swipe.
+         if self.touch_pinch_down(slot, pos) {
++            self.niri.touch_gate.on_touch_down(slot, pos, false);
+             return;
+         }
+ 
+         let serial = SERIAL_COUNTER.next_serial();
+ 
+         let under = self.niri.contents_under(pos);
++        self.niri
++            .touch_gate
++            .on_touch_down(slot, pos, under.layer.is_some());
+ 
+         let mod_key = self.backend.mod_key(&self.niri.config.borrow());
+         let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
+@@ -4293,6 +4299,7 @@ impl State {
+         };
+         let slot = evt.slot();
+ 
++        self.niri.touch_gate.on_touch_up(slot);
+         self.touch_pinch_up(slot);
+ 
+         if let Some(capture) = self.niri.screenshot_ui.pointer_up(Some(slot)) {
+@@ -4322,6 +4329,7 @@ impl State {
+         };
+         let slot = evt.slot();
+ 
++        self.niri.touch_gate.on_touch_motion(slot, pos);
+         if self.touch_pinch_motion(slot, pos, Duration::from_micros(evt.time())) {
+             return;
+         }
+@@ -4365,6 +4373,7 @@ impl State {
+         handle.frame(self);
+     }
+     fn on_touch_cancel<I: InputBackend>(&mut self, _evt: I::TouchCancelEvent) {
++        self.niri.touch_gate.on_touch_cancel();
+         self.touch_pinch_cancel();
+         let Some(handle) = self.niri.seat.get_touch() else {
+             return;
+diff --git a/src/input/touch_gate.rs b/src/input/touch_gate.rs
+new file mode 100644
+index 00000000..2ba9c265
+--- /dev/null
++++ b/src/input/touch_gate.rs
+@@ -0,0 +1,210 @@
++//! TB520FU: Lock-free 64-byte shared-memory touch/keyboard gate (`/run/user/$UID/tb520fu-touch-gate`).
++//!
++//! Written atomically by `niri` on touch down/motion/up/cancel and hardware keyboard presses;
++//! read lock-free by `tb520fu-osk` so automatic `fcitx5` `ShowVirtualKeyboard` requests only
++//! pop up the on-screen keyboard after a genuine single-finger tap on an application window
++//! (suppressing drags, multi-finger gestures, layer-shell bar taps, and physical keyboard focus changes).
++
++use std::collections::HashMap;
++use std::fs::OpenOptions;
++use std::os::fd::AsRawFd;
++use std::path::PathBuf;
++use std::ptr::NonNull;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::time::Duration;
++
++use smithay::backend::input::TouchSlot;
++use smithay::utils::{Logical, Point};
++
++const MAGIC: u64 = 0x5442_3532_3047_4154; // "TB520GAT"
++const FLAG_IS_TAP: u64 = 1 << 0;
++const FLAG_ON_LAYER: u64 = 1 << 1;
++const TAP_SLOP_LOGICAL_PX: f64 = 14.0;
++const TAP_MAX_DURATION: Duration = Duration::from_millis(550);
++
++#[repr(C, align(64))]
++struct TouchGateRaw {
++    magic: AtomicU64,
++    down_ns: AtomicU64,
++    up_ns: AtomicU64,
++    flags: AtomicU64,
++    last_hw_key_ns: AtomicU64,
++    heartbeat_ns: AtomicU64,
++    _reserved: [AtomicU64; 2],
++}
++
++struct ShmHandle {
++    ptr: NonNull<TouchGateRaw>,
++}
++
++// SAFETY: `TouchGateRaw` consists exclusively of `AtomicU64` fields in `MAP_SHARED` memory.
++unsafe impl Send for ShmHandle {}
++unsafe impl Sync for ShmHandle {}
++
++impl Drop for ShmHandle {
++    fn drop(&mut self) {
++        unsafe {
++            libc::munmap(
++                self.ptr.as_ptr().cast::<libc::c_void>(),
++                std::mem::size_of::<TouchGateRaw>(),
++            );
++        }
++    }
++}
++
++fn monotonic_ns() -> u64 {
++    let mut ts = libc::timespec {
++        tv_sec: 0,
++        tv_nsec: 0,
++    };
++    unsafe {
++        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
++    }
++    (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
++}
++
++fn gate_path() -> PathBuf {
++    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
++        PathBuf::from(dir).join("tb520fu-touch-gate")
++    } else {
++        let uid = unsafe { libc::getuid() };
++        PathBuf::from(format!("/run/user/{uid}/tb520fu-touch-gate"))
++    }
++}
++
++pub struct TouchGateWriter {
++    shm: Option<ShmHandle>,
++    start_points: HashMap<TouchSlot, Point<f64, Logical>>,
++}
++
++impl Default for TouchGateWriter {
++    fn default() -> Self {
++        let shm = Self::open_shm();
++        if let Some(ref h) = shm {
++            let now = monotonic_ns();
++            let r = unsafe { h.ptr.as_ref() };
++            r.heartbeat_ns.store(now, Ordering::Release);
++            r.magic.store(MAGIC, Ordering::Release);
++        }
++        Self {
++            shm,
++            start_points: HashMap::new(),
++        }
++    }
++}
++
++impl TouchGateWriter {
++    fn open_shm() -> Option<ShmHandle> {
++        let file = OpenOptions::new()
++            .read(true)
++            .write(true)
++            .create(true)
++            .truncate(false)
++            .open(gate_path())
++            .ok()?;
++        file.set_len(std::mem::size_of::<TouchGateRaw>() as u64).ok()?;
++        let raw = unsafe {
++            libc::mmap(
++                std::ptr::null_mut(),
++                std::mem::size_of::<TouchGateRaw>(),
++                libc::PROT_READ | libc::PROT_WRITE,
++                libc::MAP_SHARED,
++                file.as_raw_fd(),
++                0,
++            )
++        };
++        if raw == libc::MAP_FAILED {
++            return None;
++        }
++        NonNull::new(raw.cast::<TouchGateRaw>()).map(|ptr| ShmHandle { ptr })
++    }
++
++    #[inline]
++    fn raw(&self) -> Option<&TouchGateRaw> {
++        self.shm.as_ref().map(|h| unsafe { h.ptr.as_ref() })
++    }
++
++    pub fn on_touch_down(&mut self, slot: TouchSlot, pos: Point<f64, Logical>, on_layer: bool) {
++        let was_empty = self.start_points.is_empty();
++        self.start_points.insert(slot, pos);
++        let fingers = self.start_points.len().min(255) as u8;
++        let Some(r) = self.raw() else {
++            return;
++        };
++        let now = monotonic_ns();
++        if was_empty {
++            let mut flags = FLAG_IS_TAP | ((fingers as u64) << 8);
++            if on_layer {
++                flags |= FLAG_ON_LAYER;
++            }
++            r.flags.store(flags, Ordering::Relaxed);
++            r.down_ns.store(now, Ordering::Release);
++            r.heartbeat_ns.store(now, Ordering::Release);
++            r.magic.store(MAGIC, Ordering::Release);
++        } else {
++            self.mark_not_tap(fingers);
++        }
++    }
++
++    pub fn on_touch_motion(&mut self, slot: TouchSlot, pos: Point<f64, Logical>) {
++        let fingers = self.start_points.len().min(255) as u8;
++        if let Some(&start) = self.start_points.get(&slot) {
++            let dx = pos.x - start.x;
++            let dy = pos.y - start.y;
++            if dx * dx + dy * dy >= TAP_SLOP_LOGICAL_PX * TAP_SLOP_LOGICAL_PX {
++                self.mark_not_tap(fingers);
++            }
++        }
++    }
++
++    pub fn mark_not_tap(&self, fingers: u8) {
++        let Some(r) = self.raw() else {
++            return;
++        };
++        let now = monotonic_ns();
++        let prev = r.flags.load(Ordering::Relaxed);
++        let max_f = ((prev >> 8) as u8).max(fingers);
++        let next = (prev & !FLAG_IS_TAP & !(0xFF << 8)) | ((max_f as u64) << 8);
++        r.flags.store(next, Ordering::Release);
++        r.heartbeat_ns.store(now, Ordering::Release);
++    }
++
++    pub fn on_touch_up(&mut self, slot: TouchSlot) {
++        self.start_points.remove(&slot);
++        if !self.start_points.is_empty() {
++            return;
++        }
++        let Some(r) = self.raw() else {
++            return;
++        };
++        let now = monotonic_ns();
++        let down = r.down_ns.load(Ordering::Acquire);
++        if now.saturating_sub(down) > TAP_MAX_DURATION.as_nanos() as u64 {
++            let prev = r.flags.load(Ordering::Relaxed);
++            r.flags.store(prev & !FLAG_IS_TAP, Ordering::Release);
++        }
++        r.up_ns.store(now, Ordering::Release);
++        r.heartbeat_ns.store(now, Ordering::Release);
++        r.magic.store(MAGIC, Ordering::Release);
++    }
++
++    pub fn on_touch_cancel(&mut self) {
++        self.start_points.clear();
++        self.mark_not_tap(0);
++        if let Some(r) = self.raw() {
++            let now = monotonic_ns();
++            r.up_ns.store(now, Ordering::Release);
++            r.heartbeat_ns.store(now, Ordering::Release);
++        }
++    }
++
++    pub fn on_hw_key(&self) {
++        let Some(r) = self.raw() else {
++            return;
++        };
++        let now = monotonic_ns();
++        r.last_hw_key_ns.store(now, Ordering::Release);
++        r.heartbeat_ns.store(now, Ordering::Release);
++        r.magic.store(MAGIC, Ordering::Release);
++    }
++}
+diff --git a/src/input/touch_pinch.rs b/src/input/touch_pinch.rs
+index bc267e2c..a6de8fae 100644
+--- a/src/input/touch_pinch.rs
++++ b/src/input/touch_pinch.rs
+@@ -1,11 +1,10 @@
+-//! TB520FU: multi-finger pinch on the touchscreen opens / closes the overview.
++//! TB520FU: multi-finger touchscreen gestures:
++//! - 3+ finger pinch-in / spread-out -> open / close Overview (144Hz 1:1 tracking).
++//! - 3+ finger parallel horizontal swipe -> smooth Niri scrolling column pan (`view_offset_gesture`).
++//! - 3+ finger parallel vertical swipe -> smooth Niri workspace switch (`workspace_switch_gesture`).
+ //!
+-//! With at least `min_fingers` (default 3, env `NIRI_TOUCH_PINCH_FINGERS`) fingers down, pinching
+-//! in while the overview is closed, or spreading out while it is open, takes the touch sequence
+-//! over: clients get `wl_touch.cancel` and the change of the fingers' mean distance from their
+-//! centroid drives the same overview gesture the touchpad swipe uses. Spreading out over a window
+-//! in the overview activates that window, so the overview closes into it. Lifting any finger ends
+-//! the gesture; the rest of the sequence is swallowed until all fingers are up.
++//! Lifting any finger ends the gesture cleanly with spring momentum; remaining fingers are
++//! swallowed until all fingers lift.
+ 
+ use std::collections::HashMap;
+ use std::time::Duration;
+@@ -16,7 +15,7 @@ use smithay::utils::{Logical, Point};
+ 
+ use crate::niri::State;
+ 
+-// Ratio of the fingers' spread to its starting value that starts the gesture.
++// Ratio of the fingers' spread to its starting value that starts the overview pinch gesture.
+ const PINCH_IN_START: f64 = 0.85;
+ const SPREAD_OUT_START: f64 = 1.18;
+ // A spread change of this fraction of the starting spread covers the whole open/close movement.
+@@ -24,13 +23,26 @@ const FULL_MOVEMENT_FRACTION: f64 = 0.45;
+ // Matches OVERVIEW_GESTURE_MOVEMENT in layout/mod.rs.
+ const OVERVIEW_GESTURE_MOVEMENT: f64 = 300.;
+ 
++// Centroid translation (logical px) while fingers maintain parallel spread (`0.90..=1.11`)
++// that triggers 3-finger horizontal column scroll or vertical workspace switch.
++const SWIPE_START_DIST: f64 = 28.;
++const SWIPE_SPREAD_MIN_RATIO: f64 = 0.90;
++const SWIPE_SPREAD_MAX_RATIO: f64 = 1.11;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ActiveGesture {
++    OverviewPinch,
++    ViewOffset,
++    WorkspaceSwitch,
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+ pub enum PinchState {
+     /// Watching; events go to clients as usual.
+     #[default]
+     Idle,
+-    /// Driving the overview gesture; events are swallowed.
+-    Active,
++    /// Driving a compositor gesture; events are swallowed.
++    Active(ActiveGesture),
+     /// Gesture ended, waiting for the remaining fingers to lift; events are swallowed.
+     Finishing,
+ }
+@@ -38,6 +50,8 @@ pub enum PinchState {
+ pub struct TouchPinch {
+     points: HashMap<TouchSlot, Point<f64, Logical>>,
+     state: PinchState,
++    start_centroid: Point<f64, Logical>,
++    last_centroid: Point<f64, Logical>,
+     start_spread: f64,
+     last_spread: f64,
+     scale: f64,
+@@ -58,6 +72,8 @@ impl Default for TouchPinch {
+         Self {
+             points: HashMap::new(),
+             state: PinchState::Idle,
++            start_centroid: Point::from((0., 0.)),
++            last_centroid: Point::from((0., 0.)),
+             start_spread: 0.,
+             last_spread: 0.,
+             scale: 0.,
+@@ -89,7 +105,9 @@ impl TouchPinch {
+     }
+ 
+     fn reset_start(&mut self) {
+-        if let Some((_, r)) = self.spread() {
++        if let Some((c, r)) = self.spread() {
++            self.start_centroid = c;
++            self.last_centroid = c;
+             self.start_spread = r;
+             self.last_spread = r;
+         }
+@@ -101,6 +119,17 @@ impl TouchPinch {
+ }
+ 
+ impl State {
++    fn cancel_client_touch_for_gesture(&mut self) {
++        self.niri
++            .touch_gate
++            .mark_not_tap(self.niri.touch_pinch.points.len().min(255) as u8);
++        self.niri.touch_pinch.cancelling = true;
++        if let Some(handle) = self.niri.seat.get_touch() {
++            handle.cancel(self);
++        }
++        self.niri.touch_pinch.cancelling = false;
++    }
++
+     /// Returns true when the touch-down must not reach the seat (gesture in progress).
+     pub fn touch_pinch_down(&mut self, slot: TouchSlot, pos: Point<f64, Logical>) -> bool {
+         let p = &mut self.niri.touch_pinch;
+@@ -130,7 +159,7 @@ impl State {
+ 
+         match p.state {
+             PinchState::Finishing => true,
+-            PinchState::Active => {
++            PinchState::Active(ActiveGesture::OverviewPinch) => {
+                 let (_, r) = p.spread().unwrap();
+                 let delta = (p.last_spread - r) * p.scale;
+                 p.last_spread = r;
+@@ -144,60 +173,154 @@ impl State {
+                 }
+                 true
+             }
++            PinchState::Active(ActiveGesture::ViewOffset) => {
++                let (c, _) = p.spread().unwrap();
++                let dx = c.x - p.last_centroid.x;
++                p.last_centroid = c;
++                if let Some(Some(output)) = self
++                    .niri
++                    .layout
++                    .view_offset_gesture_update(-dx, timestamp, false)
++                {
++                    self.niri.queue_redraw(&output);
++                }
++                true
++            }
++            PinchState::Active(ActiveGesture::WorkspaceSwitch) => {
++                let (c, _) = p.spread().unwrap();
++                let dy = c.y - p.last_centroid.y;
++                p.last_centroid = c;
++                if let Some(Some(output)) = self
++                    .niri
++                    .layout
++                    .workspace_switch_gesture_update(-dy, timestamp, false)
++                {
++                    self.niri.queue_redraw(&output);
++                }
++                true
++            }
+             PinchState::Idle => {
+                 if p.points.len() < p.min_fingers || p.start_spread < 1. {
+                     return false;
+                 }
+                 let (centroid, r) = p.spread().unwrap();
++                let start_c = p.start_centroid;
++                let dc = centroid - start_c;
++                let dc_sq = dc.x * dc.x + dc.y * dc.y;
+                 let ratio = r / p.start_spread;
+                 let open = self.niri.layout.is_overview_open();
+-                if !((!open && ratio < PINCH_IN_START) || (open && ratio > SPREAD_OUT_START)) {
+-                    return false;
++
++                // 1. Pinch-in (open overview) or spread-out (close overview into window under centroid).
++                if (!open && ratio < PINCH_IN_START) || (open && ratio > SPREAD_OUT_START) {
++                    let start = p.start_spread;
++                    p.state = PinchState::Active(ActiveGesture::OverviewPinch);
++                    p.scale = OVERVIEW_GESTURE_MOVEMENT / (FULL_MOVEMENT_FRACTION * start).max(40.);
++                    p.last_spread = r;
++                    p.last_centroid = centroid;
++                    let scale = p.scale;
++                    let window = if open {
++                        self.niri.window_under(centroid).map(|m| m.window.clone())
++                    } else {
++                        None
++                    };
++                    self.niri.touch_pinch.window = window;
++
++                    self.cancel_client_touch_for_gesture();
++
++                    self.niri.layout.overview_gesture_begin();
++                    // Apply the movement made before the threshold so the view does not lag behind.
++                    self.niri
++                        .layout
++                        .overview_gesture_update((start - r) * scale, timestamp);
++                    self.niri.queue_redraw_all();
++                    return true;
+                 }
+ 
+-                // Take the sequence over.
+-                let start = p.start_spread;
+-                p.state = PinchState::Active;
+-                p.scale = OVERVIEW_GESTURE_MOVEMENT / (FULL_MOVEMENT_FRACTION * start).max(40.);
+-                p.last_spread = r;
+-                let scale = p.scale;
+-                let window = if open {
+-                    self.niri.window_under(centroid).map(|m| m.window.clone())
+-                } else {
+-                    None
+-                };
+-                self.niri.touch_pinch.window = window;
+-
+-                self.niri.touch_pinch.cancelling = true;
+-                if let Some(handle) = self.niri.seat.get_touch() {
+-                    handle.cancel(self);
++                // 2. Parallel 3+ finger swipe while not in Overview:
++                //    - Horizontal -> Niri scrolling column pan (`view_offset_gesture`)
++                //    - Vertical   -> Niri workspace switch (`workspace_switch_gesture`)
++                if !open
++                    && (SWIPE_SPREAD_MIN_RATIO..=SWIPE_SPREAD_MAX_RATIO).contains(&ratio)
++                    && dc_sq >= SWIPE_START_DIST * SWIPE_START_DIST
++                {
++                    if dc.x.abs() > dc.y.abs() {
++                        let output_ws = self.niri.output_under(start_c).and_then(|(output, _)| {
++                            let mon = self.niri.layout.monitor_for_output(output)?;
++                            let ws_id = mon.active_workspace_ref().id();
++                            let ws_idx = self.niri.layout.find_workspace_by_id(ws_id)?.0;
++                            Some((output.clone(), ws_idx))
++                        });
++                        if let Some((output, ws_idx)) = output_ws {
++                            self.niri.touch_pinch.state =
++                                PinchState::Active(ActiveGesture::ViewOffset);
++                            self.niri.touch_pinch.last_centroid = centroid;
++                            self.cancel_client_touch_for_gesture();
++                            self.niri
++                                .layout
++                                .view_offset_gesture_begin(&output, Some(ws_idx), false);
++                            self.niri
++                                .layout
++                                .view_offset_gesture_update(-dc.x, timestamp, false);
++                            self.niri.queue_redraw(&output);
++                            return true;
++                        }
++                    } else if let Some(output) =
++                        self.niri.output_under(start_c).map(|(o, _)| o.clone())
++                    {
++                        self.niri.touch_pinch.state =
++                            PinchState::Active(ActiveGesture::WorkspaceSwitch);
++                        self.niri.touch_pinch.last_centroid = centroid;
++                        self.cancel_client_touch_for_gesture();
++                        self.niri
++                            .layout
++                            .workspace_switch_gesture_begin(&output, false);
++                        self.niri
++                            .layout
++                            .workspace_switch_gesture_update(-dc.y, timestamp, false);
++                        self.niri.queue_redraw(&output);
++                        return true;
++                    }
+                 }
+-                self.niri.touch_pinch.cancelling = false;
+ 
+-                self.niri.layout.overview_gesture_begin();
+-                // Apply the movement made before the threshold so the view does not lag behind.
+-                self.niri
+-                    .layout
+-                    .overview_gesture_update((start - r) * scale, timestamp);
+-                self.niri.queue_redraw_all();
+-                true
++                false
+             }
+         }
+     }
+ 
+-    /// Bookkeeping for a lifted finger. Ups always reach the seat (after a cancel they are no-ops).
+-    pub fn touch_pinch_up(&mut self, slot: TouchSlot) {
+-        let p = &mut self.niri.touch_pinch;
+-        p.points.remove(&slot);
+-        if p.state == PinchState::Active {
+-            p.state = PinchState::Finishing;
+-            if let Some(window) = self.niri.touch_pinch.window.take() {
+-                self.niri.layout.activate_window(&window);
++    fn finish_active_touch_gesture(&mut self, mode: ActiveGesture) {
++        match mode {
++            ActiveGesture::OverviewPinch => {
++                if let Some(window) = self.niri.touch_pinch.window.take() {
++                    self.niri.layout.activate_window(&window);
++                }
++                if self.niri.layout.overview_gesture_end() {
++                    self.niri.queue_redraw_all();
++                }
++            }
++            ActiveGesture::ViewOffset => {
++                if let Some(output) = self.niri.layout.view_offset_gesture_end(Some(false)) {
++                    self.niri.queue_redraw(&output);
++                }
+             }
+-            if self.niri.layout.overview_gesture_end() {
+-                self.niri.queue_redraw_all();
++            ActiveGesture::WorkspaceSwitch => {
++                if let Some(output) = self.niri.layout.workspace_switch_gesture_end(Some(false)) {
++                    self.niri.queue_redraw(&output);
++                }
+             }
+         }
++    }
++
++    /// Bookkeeping for a lifted finger. Ups always reach the seat (after a cancel they are no-ops).
++    pub fn touch_pinch_up(&mut self, slot: TouchSlot) {
++        let prev_state = {
++            let p = &mut self.niri.touch_pinch;
++            p.points.remove(&slot);
++            p.state
++        };
++        if let PinchState::Active(mode) = prev_state {
++            self.niri.touch_pinch.state = PinchState::Finishing;
++            self.finish_active_touch_gesture(mode);
++        }
+         let p = &mut self.niri.touch_pinch;
+         if p.points.is_empty() {
+             p.state = PinchState::Idle;
+@@ -209,14 +332,16 @@ impl State {
+ 
+     /// The whole touch sequence was cancelled by the device.
+     pub fn touch_pinch_cancel(&mut self) {
+-        let active = self.niri.touch_pinch.state == PinchState::Active;
+-        let p = &mut self.niri.touch_pinch;
+-        p.points.clear();
+-        p.state = PinchState::Idle;
+-        p.start_spread = 0.;
+-        p.window = None;
+-        if active && self.niri.layout.overview_gesture_end() {
+-            self.niri.queue_redraw_all();
++        let prev_state = self.niri.touch_pinch.state;
++        {
++            let p = &mut self.niri.touch_pinch;
++            p.points.clear();
++            p.state = PinchState::Idle;
++            p.start_spread = 0.;
++            p.window = None;
++        }
++        if let PinchState::Active(mode) = prev_state {
++            self.finish_active_touch_gesture(mode);
+         }
+     }
+ }
+diff --git a/src/niri.rs b/src/niri.rs
+index 7c9a5382..79c993b9 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -379,6 +379,7 @@ pub struct Niri {
+     pub tablet_cursor_location: Option<Point<f64, Logical>>,
+     pub gesture_swipe_3f_cumulative: Option<(f64, f64)>,
+     pub touch_pinch: crate::input::touch_pinch::TouchPinch,
++    pub touch_gate: crate::input::touch_gate::TouchGateWriter,
+     pub overview_scroll_swipe_gesture: ScrollSwipeGesture,
+     pub vertical_wheel_tracker: ScrollTracker,
+     pub horizontal_wheel_tracker: ScrollTracker,
+@@ -2850,6 +2851,7 @@ impl Niri {
+             tablet_cursor_location: None,
+             gesture_swipe_3f_cumulative: None,
+             touch_pinch: Default::default(),
++            touch_gate: Default::default(),
+             overview_scroll_swipe_gesture: ScrollSwipeGesture::new(),
+             vertical_wheel_tracker: ScrollTracker::new(120),
+             horizontal_wheel_tracker: ScrollTracker::new(120),
+-- 
+2.47.3
+

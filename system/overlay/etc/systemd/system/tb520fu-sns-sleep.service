@@ -1,0 +1,19 @@
+[Unit]
+Description=TB520FU: stop sensor streaming across suspend (ADSP sensor samples wake the system)
+Before=sleep.target
+StopWhenUnneeded=yes
+
+# iio-sensor-proxy is D-Bus activated: the shell / tb520fu-daemon re-activate it the moment it is
+# stopped, so during suspend entry it used to come back half-initialised ("QRTR bus unavailable")
+# and stayed sensorless after resume. Runtime-mask it while sleeping and restart it on resume.
+# "-": a failed stop must not fail this unit, otherwise ExecStop never runs after resume.
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=-/usr/bin/systemctl mask --runtime iio-sensor-proxy.service
+ExecStart=-/usr/bin/systemctl stop iio-sensor-proxy.service
+ExecStop=-/usr/bin/systemctl unmask --runtime iio-sensor-proxy.service
+ExecStop=/usr/bin/systemctl restart --no-block iio-sensor-proxy.service
+
+[Install]
+WantedBy=sleep.target

@@ -1,0 +1,39 @@
+// Minimal locked-down Niri configuration for greetd graphical PAM login (`_greetd`)
+input {
+    touch {
+        map-to-output "DSI-1"
+    }
+    tablet {
+        map-to-output "DSI-1"
+    }
+    touchpad {
+        tap
+        dwt
+        dwtp
+        drag true
+        natural-scroll
+        click-method "button-areas"
+    }
+}
+
+output "DSI-1" {
+    scale 2.0
+    position x=0 y=0
+}
+
+hotkey-overlay {
+    skip-at-startup
+}
+
+prefer-no-csd
+
+spawn-at-startup "/usr/local/bin/tb520fu-shell" "--greeter" "--user" "debian" "--cmd" "/usr/local/bin/tb520fu-user-session"
+
+binds {
+    XF86AudioRaiseVolume  allow-when-locked=true { spawn "tb520fu-shell" "vol" "+5"; }
+    XF86AudioLowerVolume  allow-when-locked=true { spawn "tb520fu-shell" "vol" "-5"; }
+    XF86AudioMute         allow-when-locked=true { spawn "tb520fu-shell" "mute"; }
+    XF86AudioMicMute      allow-when-locked=true { spawn "tb520fu-shell" "mic-mute"; }
+    XF86MonBrightnessUp   allow-when-locked=true { spawn "tb520fu-shell" "bri" "+6"; }
+    XF86MonBrightnessDown allow-when-locked=true { spawn "tb520fu-shell" "bri" "-6"; }
+}

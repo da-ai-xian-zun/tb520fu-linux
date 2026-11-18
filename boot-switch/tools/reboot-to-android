@@ -1,0 +1,7 @@
+#!/bin/sh
+# 供设置应用（tb520fu-settings）与命令行直接调用：优先经 tb520fu-daemon socket 免提权触发，回退 tb520fu-bootflag。
+set -eu
+if [ -S /run/tb520fu-daemon.sock ] && [ -x /usr/local/bin/tb520fu-daemon ]; then
+	exec /usr/local/bin/tb520fu-daemon ctl reboot-android >/dev/null
+fi
+exec /usr/local/sbin/tb520fu-bootflag reboot-android

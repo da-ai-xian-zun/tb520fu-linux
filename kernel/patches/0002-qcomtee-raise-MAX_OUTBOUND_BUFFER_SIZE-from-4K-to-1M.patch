@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: da-ai-xian-zun <163512031+da-ai-xian-zun@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 13:07:43 -0500
+Subject: [PATCH 02/10] qcomtee: raise MAX_OUTBOUND_BUFFER_SIZE from 4K to 1M
+
+The Goodix fingerprint TA returns large responses (device info about
+5.5 KB, interrupt payloads around 320 KB); QTEE rejects a too-small
+outbound buffer with OBJECT_ERROR_MAXDATA. 1M stays within an order-8
+alloc_pages_exact() allocation and needs no CMA.
+---
+ drivers/tee/qcomtee/shm.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/tee/qcomtee/shm.c b/drivers/tee/qcomtee/shm.c
+index 26b2ce699..e8dea394e 100644
+--- a/drivers/tee/qcomtee/shm.c
++++ b/drivers/tee/qcomtee/shm.c
+@@ -15,9 +15,13 @@
+ /**
+  * define MAX_OUTBOUND_BUFFER_SIZE - Maximum size of outbound buffers.
+  *
+- * The size of outbound buffer depends on QTEE callback requests.
++ * The size of outbound buffer depends on QTEE callback requests. Raised from
++ * SZ_4K to SZ_1M: Goodix goodixfp64 TA responses are large (GET_DEV_INFO ~5.5KB,
++ * IRQ event payload ~320KB; reqOut+rspOut for IRQ ~655KB). QTEE rejects an
++ * invoke whose outbound buffer is too small with OBJECT_ERROR_MAXDATA (-95).
++ * 1MB stays within alloc_pages_exact() order-8 (no CMA needed).
+  */
+-#define MAX_OUTBOUND_BUFFER_SIZE SZ_4K
++#define MAX_OUTBOUND_BUFFER_SIZE SZ_1M
+ 
+ /**
+  * define MAX_INBOUND_BUFFER_SIZE - Maximum size of the inbound buffer.

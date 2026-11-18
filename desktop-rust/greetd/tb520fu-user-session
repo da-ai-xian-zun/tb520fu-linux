@@ -1,0 +1,53 @@
+#!/bin/sh
+# User Wayland session wrapper for greetd on TB520FU.
+# 1. Reaps any orphaned niri.service left behind by a prior greetd restart/crash
+#    so /usr/local/bin/niri-session never aborts with "A niri session is already running."
+# 2. Tears down niri.service cleanly if greetd terminates the session scope (SIGTERM/SIGHUP).
+
+export PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=niri
+unset GREETD_SOCK
+
+UID_NUM="$(id -u)"
+
+if command -v systemctl >/dev/null 2>&1; then
+    if systemctl --user -q is-active niri.service || pgrep -u "$UID_NUM" -x niri >/dev/null 2>&1; then
+        systemctl --user stop tb520fu-idle.service tb520fu-shell.service tb520fu-osk.service niri.service 2>/dev/null || true
+        systemctl --user start --job-mode=replace-irreversibly niri-shutdown.target 2>/dev/null || true
+        i=0
+        while [ "$i" -lt 30 ]; do
+            if ! systemctl --user -q is-active niri.service && ! pgrep -u "$UID_NUM" -x niri >/dev/null 2>&1; then
+                break
+            fi
+            sleep 0.1
+            i=$((i + 1))
+        done
+        pkill -u "$UID_NUM" -x niri 2>/dev/null || true
+        pkill -u "$UID_NUM" -x fcitx5 2>/dev/null || true
+    fi
+    systemctl --user unset-environment WAYLAND_DISPLAY DISPLAY NIRI_SOCKET 2>/dev/null || true
+    systemctl --user reset-failed 2>/dev/null || true
+fi
+
+SESSION_PID=""
+cleanup_session() {
+    trap - INT TERM HUP
+    if [ -n "$SESSION_PID" ]; then
+        kill -TERM "$SESSION_PID" 2>/dev/null || true
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user stop tb520fu-idle.service tb520fu-shell.service tb520fu-osk.service niri.service 2>/dev/null || true
+        systemctl --user start --job-mode=replace-irreversibly niri-shutdown.target 2>/dev/null || true
+        systemctl --user unset-environment WAYLAND_DISPLAY DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP NIRI_SOCKET 2>/dev/null || true
+    fi
+    exit 0
+}
+trap cleanup_session INT TERM HUP
+
+/usr/local/bin/niri-session "$@" &
+SESSION_PID=$!
+wait "$SESSION_PID"
+RC=$?
+trap - INT TERM HUP
+exit "$RC"

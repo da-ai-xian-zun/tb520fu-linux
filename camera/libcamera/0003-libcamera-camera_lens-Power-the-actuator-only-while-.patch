@@ -1,0 +1,136 @@
+From 9a7e0b12fc57bc8c8f773548e025ec431de9e8bf Mon Sep 17 00:00:00 2001
+From: da-ai-xian-zun <163512031+da-ai-xian-zun@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 03:25:59 -0500
+Subject: [PATCH 3/6] libcamera: camera_lens: Power the actuator only while
+ streaming
+
+Lens drivers commonly keep the actuator powered through runtime PM for as
+long as the subdev node is open. CameraLens opened the node at init time
+and never closed it, so an idle camera kept its VCM powered.
+
+Close the subdev after init, open it on demand in setFocusPosition() and
+add open()/close() so that the simple pipeline handler can power the
+actuator for the duration of a capture session, restoring the last focus
+position on start.
+---
+ include/libcamera/internal/camera_lens.h |  4 +++
+ src/libcamera/camera_lens.cpp            | 45 ++++++++++++++++++++++++
+ src/libcamera/pipeline/simple/simple.cpp | 14 ++++++++
+ 3 files changed, 63 insertions(+)
+
+diff --git a/include/libcamera/internal/camera_lens.h b/include/libcamera/internal/camera_lens.h
+index f347c5e..e77f3e0 100644
+--- a/include/libcamera/internal/camera_lens.h
++++ b/include/libcamera/internal/camera_lens.h
+@@ -29,6 +29,10 @@ public:
+ 	int init();
+ 	int setFocusPosition(int32_t position);
+ 
++	int open();
++	void close();
++	bool isOpen() const;
++
+ 	const std::string &model() const { return model_; }
+ 
+ 	const ControlInfoMap &controls() const;
+diff --git a/src/libcamera/camera_lens.cpp b/src/libcamera/camera_lens.cpp
+index ccc2a6a..7a0dd68 100644
+--- a/src/libcamera/camera_lens.cpp
++++ b/src/libcamera/camera_lens.cpp
+@@ -73,9 +73,50 @@ int CameraLens::init()
+ 		return ret;
+ 
+ 	model_ = subdev_->model();
++
++	/*
++	 * Keep the subdev closed until it is needed. Lens drivers typically
++	 * power the actuator through runtime PM while their device node is
++	 * open, so an idle camera would otherwise keep the VCM powered.
++	 */
++	subdev_->close();
++
+ 	return 0;
+ }
+ 
++/**
++ * \brief Open the lens subdev, powering up the actuator
++ *
++ * The controls retrieved at init() time stay valid while the subdev is
++ * closed. Opening an already open lens is a no-op.
++ *
++ * \return 0 on success or a negative error code otherwise
++ */
++int CameraLens::open()
++{
++	if (subdev_->isOpen())
++		return 0;
++
++	return subdev_->open();
++}
++
++/**
++ * \brief Close the lens subdev, allowing the actuator to power down
++ */
++void CameraLens::close()
++{
++	subdev_->close();
++}
++
++/**
++ * \brief Check if the lens subdev is open
++ * \return True if the lens subdev is open, false otherwise
++ */
++bool CameraLens::isOpen() const
++{
++	return subdev_->isOpen();
++}
++
+ /**
+  * \brief This function sets the focal point of the lens to a specific position.
+  * \param[in] position The focal point of the lens
+@@ -86,6 +127,10 @@ int CameraLens::init()
+  */
+ int CameraLens::setFocusPosition(int32_t position)
+ {
++	int ret = open();
++	if (ret)
++		return ret;
++
+ 	ControlList lensCtrls(subdev_->controls());
+ 	lensCtrls.set(V4L2_CID_FOCUS_ABSOLUTE, static_cast<int32_t>(position));
+ 
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index c554486..90927bc 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -1723,6 +1723,17 @@ int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlL
+ 		return -EBUSY;
+ 	}
+ 
++	/*
++	 * Power the focus actuator only while streaming, and restore the last
++	 * position as the actuator loses it when powered down.
++	 */
++	if (data->focusLens_) {
++		ret = data->focusLens_->setFocusPosition(data->focusPosition_);
++		if (ret)
++			LOG(SimplePipeline, Warning)
++				<< "Failed to power up the focus lens: " << ret;
++	}
++
+ 	if (data->useConversion_ && !data->rawStream_) {
+ 		/*
+ 		 * When using the converter allocate a fixed number of internal
+@@ -1812,6 +1823,9 @@ void SimplePipelineHandler::stopDevice(Camera *camera)
+ 	data->clearIncompleteRequests();
+ 	data->conversionBuffers_.clear();
+ 
++	if (data->focusLens_)
++		data->focusLens_->close();
++
+ 	releasePipeline(data);
+ }
+ 
+-- 
+2.47.3
+

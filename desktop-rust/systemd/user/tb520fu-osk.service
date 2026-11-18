@@ -1,0 +1,15 @@
+[Unit]
+Description=TB520FU OriginOS Pure-Rust On-Screen Keyboard (fcitx5 Frontend)
+ConditionUser=!@system
+PartOf=graphical-session.target
+After=graphical-session.target niri.service
+Conflicts=sm.puri.OSK0.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tb520fu-osk
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=niri.service graphical-session.target

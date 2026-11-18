@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: GPL-3.0-only
+import { Theme, Icons, BtRow } from "theme.slint";
+import { SectionTitle, Card, CardGap, Divider, RowIconBadge, PillButton, TagPill, SwitchPill } from "widgets.slint";
+
+export component BtPage inherits VerticalLayout {
+    in property <bool> bt-enabled: true;
+    in property <bool> discovering: false;
+    in property <[BtRow]> paired: [];
+    in property <[BtRow]> discovered: [];
+    in property <string> pulse-tag: "";
+
+    callback toggle-bt(bool);
+    callback toggle-scan(bool);
+    callback connect-or-disconnect(BtRow);
+    callback forget-device(BtRow);
+    callback pair-device(BtRow);
+
+    spacing: 0px;
+
+    Card {
+        pulse: root.pulse-tag == "bt-sw";
+        HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            padding-top: 11px;
+            padding-bottom: 11px;
+            spacing: 12px;
+
+            VerticalLayout {
+                alignment: center;
+                RowIconBadge { icon: Icons.bt; active: root.bt-enabled; }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 2px;
+                horizontal-stretch: 1;
+                Text {
+                    text: "蓝牙";
+                    font-size: 14.5px;
+                    font-weight: 600;
+                    color: Theme.ink;
+                }
+                Text {
+                    text: root.bt-enabled ? "可被发现为“yoga-tb520fu”" : "已关闭";
+                    font-size: 12px;
+                    color: Theme.sub;
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                SwitchPill {
+                    checked: root.bt-enabled;
+                    toggled(v) => { root.toggle-bt(v); }
+                }
+            }
+        }
+    }
+
+    if root.bt-enabled : VerticalLayout {
+        spacing: 0px;
+        SectionTitle { text: "我的设备"; }
+        Card {
+            VerticalLayout {
+                if root.paired.length == 0 : Rectangle {
+                    min-height: 54px;
+                    Text {
+                        text: "暂无已配对设备";
+                        font-size: 13px;
+                        color: Theme.sub;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                for dev[idx] in root.paired : VerticalLayout {
+                    if idx > 0 : Divider {}
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        padding-top: 10px;
+                        padding-bottom: 10px;
+                        spacing: 12px;
+
+                        VerticalLayout {
+                            alignment: center;
+                            RowIconBadge {
+                                icon: dev.is-pen ? Icons.pen : Icons.headphone;
+                                active: dev.connected;
+                            }
+                        }
+
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 2px;
+                            horizontal-stretch: 1;
+                            Text {
+                                text: dev.name;
+                                font-size: 14.5px;
+                                font-weight: 600;
+                                color: Theme.ink;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: dev.subtitle;
+                                font-size: 12px;
+                                color: Theme.sub;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: center;
+                            if dev.has-battery : VerticalLayout { alignment: center; TagPill { text: dev.battery-text; green: true; } }
+                            VerticalLayout {
+                                alignment: center;
+                                PillButton {
+                                    text: dev.connected ? "断开" : "连接";
+                                    clicked => { root.connect-or-disconnect(dev); }
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                PillButton {
+                                    text: "忘记";
+                                    danger: true;
+                                    clicked => { root.forget-device(dev); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        CardGap {}
+
+        Card {
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 12px;
+                padding-bottom: 12px;
+                spacing: 12px;
+
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: root.discovering ? "正在搜索附近可配对的设备…" : "搜索附近可配对的耳机、键盘与外设";
+                        font-size: 13px;
+                        color: Theme.sub;
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    PillButton {
+                        text: root.discovering ? "停止扫描" : "扫描新设备";
+                        primary: !root.discovering;
+                        clicked => { root.toggle-scan(!root.discovering); }
+                    }
+                }
+            }
+        }
+
+        if root.discovered.length > 0 : VerticalLayout {
+            spacing: 0px;
+            SectionTitle { text: "附近可配对设备"; }
+            Card {
+                VerticalLayout {
+                    for dev[idx] in root.discovered : VerticalLayout {
+                        if idx > 0 : Divider {}
+                        Rectangle {
+                            min-height: 56px;
+                            background: d-ta.has-hover ? Theme.tile-bg : transparent;
+                            d-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.pair-device(dev); }
+                            }
+                            HorizontalLayout {
+                                padding-left: 16px;
+                                padding-right: 16px;
+                                spacing: 12px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    RowIconBadge { icon: Icons.headphone; }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 2px;
+                                    horizontal-stretch: 1;
+                                    Text {
+                                        text: dev.name;
+                                        font-size: 14.5px;
+                                        font-weight: 600;
+                                        color: Theme.ink;
+                                    }
+                                    Text {
+                                        text: dev.subtitle;
+                                        font-size: 12px;
+                                        color: Theme.sub;
+                                    }
+                                }
+                                HorizontalLayout {
+                                    alignment: center;
+                                    spacing: 8px;
+                                    VerticalLayout { alignment: center; TagPill { text: "点击配对"; blue: true; } }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Image {
+                                            width: 15px;
+                                            height: 15px;
+                                            source: Icons.chev-right;
+                                            colorize: Theme.sub;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    CardGap {}
+}

@@ -1,0 +1,9 @@
+[Unit]
+Description=Qualcomm FastRPC daemon for ADSP Sensors PD (TB520FU)
+After=dbus.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/hexagonrpcd -f /dev/fastrpc-adsp -d adsp -s -R /usr/share/qcom/sm8650/Lenovo/tb520fu
+Restart=on-failure
+RestartSec=2

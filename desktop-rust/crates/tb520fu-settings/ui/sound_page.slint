@@ -1,0 +1,185 @@
+// SPDX-License-Identifier: GPL-3.0-only
+import { Theme, Icons, AudioRow } from "theme.slint";
+import { SectionTitle, Card, CardGap, Divider, RowIconBadge, SwitchRow, SliderRow, TagPill } from "widgets.slint";
+
+export component SoundPage inherits VerticalLayout {
+    in-out property <int> out-vol: 55;
+    in property <bool> out-muted: false;
+    in-out property <int> mic-vol: 80;
+    in property <bool> mic-muted: false;
+    in property <[AudioRow]> sinks: [];
+    in property <[AudioRow]> sources: [];
+    in property <string> pulse-tag: "";
+
+    callback change-out-vol(int);
+    callback toggle-out-mute(bool);
+    callback change-mic-vol(int);
+    callback toggle-mic-mute(bool);
+    callback select-node(int);
+
+    spacing: 0px;
+
+    SectionTitle { text: "输出音量与设备"; first: true; }
+    Card {
+        pulse: root.pulse-tag == "vol";
+        VerticalLayout {
+            SliderRow {
+                has-icon: true;
+                icon: Icons.sound;
+                title: "主音量";
+                minimum: 0;
+                maximum: 100;
+                value <=> root.out-vol;
+                changed(v) => { root.change-out-vol(v); }
+            }
+            Divider {}
+            SwitchRow {
+                has-icon: true;
+                icon: Icons.sound;
+                title: "静音输出";
+                checked: root.out-muted;
+                toggled(v) => { root.toggle-out-mute(v); }
+            }
+        }
+    }
+
+    if root.sinks.length > 0 : VerticalLayout {
+        spacing: 0px;
+        CardGap {}
+        Card {
+            VerticalLayout {
+                for s[idx] in root.sinks : VerticalLayout {
+                    if idx > 0 : Divider {}
+                    Rectangle {
+                        min-height: 58px;
+                        background: s-ta.has-hover ? Theme.tile-bg : transparent;
+                        s-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                if (!s.active) {
+                                    root.select-node(s.id);
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            padding-top: 9px;
+                            padding-bottom: 9px;
+                            spacing: 12px;
+                            VerticalLayout {
+                                alignment: center;
+                                RowIconBadge {
+                                    icon: s.is-bt ? Icons.headphone : Icons.sound;
+                                    active: s.active;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 2px;
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: s.name;
+                                    font-size: 14.5px;
+                                    font-weight: s.active ? 700 : 500;
+                                    color: Theme.ink;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: s.subtitle;
+                                    font-size: 12px;
+                                    color: Theme.sub;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                if s.active : TagPill { text: "当前输出"; blue: true; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    SectionTitle { text: "麦克风输入"; }
+    Card {
+        pulse: root.pulse-tag == "mic";
+        VerticalLayout {
+            SliderRow {
+                has-icon: true;
+                icon: Icons.mic;
+                title: "输入增益";
+                minimum: 0;
+                maximum: 100;
+                value <=> root.mic-vol;
+                changed(v) => { root.change-mic-vol(v); }
+            }
+            Divider {}
+            SwitchRow {
+                has-icon: true;
+                icon: Icons.mic;
+                title: "麦克风静音";
+                checked: root.mic-muted;
+                toggled(v) => { root.toggle-mic-mute(v); }
+            }
+        }
+    }
+
+    if root.sources.length > 0 : VerticalLayout {
+        spacing: 0px;
+        CardGap {}
+        Card {
+            VerticalLayout {
+                for src[idx] in root.sources : VerticalLayout {
+                    if idx > 0 : Divider {}
+                    Rectangle {
+                        min-height: 58px;
+                        background: src-ta.has-hover ? Theme.tile-bg : transparent;
+                        src-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                if (!src.active) {
+                                    root.select-node(src.id);
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            padding-top: 9px;
+                            padding-bottom: 9px;
+                            spacing: 12px;
+                            VerticalLayout {
+                                alignment: center;
+                                RowIconBadge { icon: Icons.mic; active: src.active; }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 2px;
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: src.name;
+                                    font-size: 14.5px;
+                                    font-weight: src.active ? 700 : 500;
+                                    color: Theme.ink;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: src.subtitle;
+                                    font-size: 12px;
+                                    color: Theme.sub;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                if src.active : TagPill { text: "当前输入"; blue: true; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    CardGap {}
+}

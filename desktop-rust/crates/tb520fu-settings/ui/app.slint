@@ -1,0 +1,1440 @@
+// SPDX-License-Identifier: GPL-3.0-only
+import { Theme, Icons, WifiRow, BtRow, AudioRow, SuspendRow, NotifAppRow, SearchHit } from "theme.slint";
+import { PillButton, SearchField, ModalField, Divider } from "widgets.slint";
+import { WifiPage } from "wifi_page.slint";
+import { BtPage } from "bt_page.slint";
+import { DisplayPage } from "display_page.slint";
+import { SoundPage } from "sound_page.slint";
+import { NotifPage } from "notif_page.slint";
+import { PowerPage } from "power_page.slint";
+import { PenPage } from "pen_page.slint";
+import { SysPage } from "sys_page.slint";
+
+export { WifiRow, BtRow, AudioRow, SuspendRow, NotifAppRow, SearchHit }
+
+component NavItem inherits Rectangle {
+    in property <image> icon;
+    in property <string> label;
+    in property <string> summary;
+    in property <bool> active: false;
+    in property <bool> single-mode: false;
+    callback clicked();
+
+    height: root.single-mode ? 54px : 44px;
+    border-radius: root.single-mode ? 15px : 12px;
+    border-width: root.single-mode || root.active ? 1px : 0px;
+    border-color: root.single-mode ? Theme.glass-border : Theme.glass-sub-border;
+    background: root.single-mode
+        ? (ta.has-hover
+            ? @linear-gradient(160deg, Theme.card-hover 0%, Theme.card-glass-bot 100%)
+            : @linear-gradient(160deg, Theme.card-glass-top 0%, Theme.card-glass-bot 100%))
+        : (root.active
+            ? @linear-gradient(155deg, Theme.accent-soft 0%, Theme.glass-sub-bot 100%)
+            : (ta.has-hover
+                ? @linear-gradient(155deg, Theme.tile-hover 0%, Theme.tile-bg 100%)
+                : @linear-gradient(155deg, #ffffff00 0%, #ffffff00 100%)));
+    clip: true;
+
+    if root.single-mode || root.active : Rectangle {
+        x: 12px;
+        y: 0px;
+        width: Math.max(0px, parent.width - 24px);
+        height: 1px;
+        background: @linear-gradient(90deg, #ffffff00 0%, Theme.glass-specular 50%, #ffffff00 100%);
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        padding-left: root.single-mode ? 14px : 12px;
+        padding-right: root.single-mode ? 14px : 11px;
+        spacing: 11px;
+
+        VerticalLayout {
+            alignment: center;
+            Image {
+                width: 19px;
+                height: 19px;
+                source: root.icon;
+                colorize: root.active && !root.single-mode ? Theme.accent-ink : Theme.ink-muted;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            Text {
+                text: root.label;
+                font-size: 14px;
+                font-weight: root.active && !root.single-mode ? 700 : 500;
+                color: root.active && !root.single-mode ? Theme.accent-ink : Theme.ink;
+                overflow: elide;
+            }
+        }
+
+        HorizontalLayout {
+            alignment: center;
+            spacing: 6px;
+            Text {
+                text: root.summary;
+                font-size: 11.5px;
+                color: Theme.sub;
+                vertical-alignment: center;
+            }
+            if root.single-mode : VerticalLayout {
+                alignment: center;
+                Image {
+                    width: 15px;
+                    height: 15px;
+                    source: Icons.chev-right;
+                    colorize: Theme.sub;
+                }
+            }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "设置";
+    default-font-family: "Noto Sans CJK SC";
+    preferred-width: 1040px;
+    preferred-height: 780px;
+    min-width: 380px;
+    min-height: 480px;
+    background: Theme.win-bg;
+
+    // 3-tier responsive breakpoints driven strictly by window width:
+    //   < 850px: spacious single-column stack (33% = 480px, 50% = 724px)
+    //   850px..1150px: standard 2-column (220px sidebar + full detail)
+    //   > 1150px: wide 2-column (240px sidebar + 810px centered detail)
+    property <bool> is-single: root.width < 850px;
+    property <bool> is-wide: root.width > 1150px;
+
+    in-out property <string> active-page: "display";
+    in-out property <bool> drill: true;
+    in-out property <bool> light-skin: false;
+    in-out property <int> accent-idx: 0;
+    in property <string> device-subtitle: "90% · 旁路直供";
+    in property <string> pulse-tag: "";
+    in property <string> toast-text: "";
+
+    // Per-page scroll offset memory
+    property <length> scroll-wifi: 0px;
+    property <length> scroll-bt: 0px;
+    property <length> scroll-display: 0px;
+    property <length> scroll-sound: 0px;
+    property <length> scroll-notif: 0px;
+    property <length> scroll-power: 0px;
+    property <length> scroll-pen: 0px;
+    property <length> scroll-sys: 0px;
+
+    // Search state
+    in-out property <string> search-query: "";
+    in property <[SearchHit]> search-hits: [];
+    in-out property <int> search-sel: 0;
+
+    // Sidebar status summaries
+    in property <string> sum-wifi: "已连接";
+    in property <string> sum-bt: "已开启";
+    in property <string> sum-display: "2.0× · 120Hz";
+    in property <string> sum-sound: "55%";
+    in property <string> sum-notif: "开启";
+    in property <string> sum-power: "90%";
+    in property <string> sum-pen: "就绪";
+    in property <string> sum-sys: "Shanghai";
+
+    // Page properties — Wi-Fi
+    in property <bool> wifi-enabled: true;
+    in property <bool> airplane-mode: false;
+    in property <string> wired-summary: "";
+    in property <bool> wifi-scanning: false;
+    in property <bool> wifi-has-active: false;
+    in property <string> wifi-active-ssid: "";
+    in property <string> wifi-active-detail: "";
+    in property <[WifiRow]> wifi-networks: [];
+
+    // Page properties — Bluetooth
+    in property <bool> bt-enabled: true;
+    in property <bool> bt-discovering: false;
+    in property <[BtRow]> bt-paired: [];
+    in property <[BtRow]> bt-discovered: [];
+
+    // Page properties — Display & Appearance
+    in property <bool> shell-online: true;
+    in property <int> skin-idx: 0;
+    in property <string> accent-label: "经典钴蓝";
+    in property <int> wallpaper-preset-idx: 0;
+    in property <string> wallpaper-label: "ZUI 原厂流羽";
+    in property <[string]> local-wall-labels: [];
+    in-out property <int> brightness: 60;
+    in property <bool> autobright: true;
+    in property <int> hbm-idx: 0;
+    in property <bool> night-light: false;
+    in property <bool> reading-mode: false;
+    in property <bool> dsi-hdr: true;
+    in property <bool> high-refresh: true;
+    in property <bool> auto-rotate: true;
+    in property <int> presets-idx: 0;
+    in property <string> presets-label: "33% · 50% · 67% · 100%";
+    in property <int> scale-idx: 2;
+    in property <string> scale-value-text: "2.00×";
+    in property <string> logical-res-text: "1472×920";
+    in property <bool> ext-connected: false;
+    in property <string> ext-name: "";
+    in property <bool> ext-enabled: true;
+    in property <[string]> ext-modes: [];
+    in property <int> ext-mode-idx: 0;
+    in property <string> ext-mode-label: "";
+    in property <int> ext-pos-idx: 2;
+
+    // Page properties — Sound
+    in-out property <int> out-vol: 55;
+    in property <bool> out-muted: false;
+    in-out property <int> mic-vol: 80;
+    in property <bool> mic-muted: false;
+    in property <[AudioRow]> audio-sinks: [];
+    in property <[AudioRow]> audio-sources: [];
+
+    // Page properties — Notifications & Focus
+    in property <bool> dnd: false;
+    in property <bool> dnd-fullscreen: true;
+    in property <bool> dnd-schedule-enabled: false;
+    in property <int> dnd-start-idx: 1;
+    in property <string> dnd-start-label: "23:00";
+    in property <int> dnd-end-idx: 1;
+    in property <string> dnd-end-label: "07:30";
+    in property <int> banner-timeout-idx: 1;
+    in property <int> lock-notif-idx: 0;
+    in property <string> lock-notif-label: "显示完整内容";
+    in property <[NotifAppRow]> notif-apps: [];
+
+    // Page properties — Power
+    in property <int> battery-pct: 90;
+    in property <string> battery-headline: "90% · 旁路直供";
+    in property <string> battery-detail: "";
+    in property <bool> bypass-enabled: true;
+    in property <bool> bypass-active: true;
+    in property <int> profile-idx: 1;
+    in property <int> lock-idx: 2;
+    in property <string> lock-label: "5 分钟";
+    in property <int> suspend-idx: 0;
+    in property <string> suspend-label: "不自动休眠";
+    in property <[SuspendRow]> suspend-logs: [];
+
+    // Page properties — Pen, Touchpad, OSK & Keyboard
+    in property <string> pen-status-text: "";
+    in property <string> pen-badge-text: "就绪";
+    in property <bool> pen-corners: false;
+    in property <bool> pen-orb: false;
+    in property <bool> tp-tap: true;
+    in property <bool> tp-natural: true;
+    in-out property <int> tp-speed: 55;
+    in property <bool> osk-auto-popup: true;
+    in property <int> osk-mode-idx: 0;
+    in property <bool> osk-sound-on: true;
+    in property <int> osk-sound-idx: 0;
+    in property <bool> kb-caps-ctrl: false;
+    in property <int> ime-trigger-idx: 0;
+    in property <string> ime-trigger-label: "Ctrl + Space";
+
+    // Page properties — System & Default Apps
+    in property <bool> ntp-enabled: true;
+    in property <string> current-tz: "Asia/Shanghai";
+    in property <[string]> tz-options: [
+        "Asia/Shanghai", "Asia/Hong_Kong", "Asia/Taipei", "Asia/Tokyo", "Asia/Singapore",
+        "Europe/London", "Europe/Berlin", "America/Los_Angeles", "America/New_York", "UTC"
+    ];
+    in property <int> tz-idx: 0;
+    in property <int> lang-idx: 0;
+    in property <string> lang-label: "简体中文 (zh_CN.UTF-8)";
+    in property <[string]> browser-app-names: [];
+    in property <int> browser-app-idx: 0;
+    in property <string> default-browser-label: "—";
+    in property <[string]> pdf-app-names: [];
+    in property <int> pdf-app-idx: 0;
+    in property <string> default-pdf-label: "—";
+    in property <[string]> image-app-names: [];
+    in property <int> image-app-idx: 0;
+    in property <string> default-image-label: "—";
+    in property <[string]> media-app-names: [];
+    in property <int> media-app-idx: 0;
+    in property <string> default-media-label: "—";
+    in property <string> current-user: "debian";
+    in property <string> hostname: "yoga-tb520fu";
+    in property <string> kernel: "7.3.3";
+    in property <string> os-pretty: "Debian 13";
+    in property <string> ram-gb: "16 GB";
+    in property <string> storage-summary: "—";
+    in property <string> storage-tool-label: "";
+    in property <bool> boot-switch-ready: false;
+
+    // Dropdown Picker overlay state
+    in-out property <string> picker-kind: "";
+    in-out property <string> picker-title: "";
+    in-out property <[string]> picker-items: [];
+    in-out property <int> picker-selected: 0;
+
+    // Modal state ("" | "wifi-pw" | "bt-pair" | "hostname" | "custom-wall" | "passwd" | "reboot-android")
+    in-out property <string> modal-kind: "";
+    in-out property <string> modal-title: "";
+    in-out property <string> modal-subtitle: "";
+    in-out property <string> modal-input: "";
+    in-out property <string> modal-input2: "";
+    in-out property <string> modal-input3: "";
+    in property <string> modal-passkey: "";
+
+    // Callbacks
+    callback page-selected(string);
+    callback search-edited(string);
+    callback activate-search-hit(SearchHit);
+
+    callback toggle-wifi(bool);
+    callback toggle-airplane(bool);
+    callback wifi-rescan();
+    callback wifi-forget(string);
+    callback wifi-select(WifiRow);
+    callback wifi-submit-password(string, string);
+
+    callback toggle-bt(bool);
+    callback bt-toggle-scan(bool);
+    callback bt-connect-or-disconnect(BtRow);
+    callback bt-forget(BtRow);
+    callback bt-pair(BtRow);
+    callback bt-confirm-pair(bool);
+
+    callback change-skin(int);
+    callback change-accent(int);
+    callback select-wallpaper-preset(int);
+    callback refresh-local-wallpapers();
+    callback select-local-wallpaper(int);
+    callback submit-custom-wallpaper(string);
+    callback change-brightness(int);
+    callback toggle-autobright(bool);
+    callback change-hbm(int);
+    callback toggle-night-light(bool);
+    callback toggle-reading-mode(bool);
+    callback toggle-dsi-hdr(bool);
+    callback toggle-high-refresh(bool);
+    callback toggle-auto-rotate(bool);
+    callback change-presets(int);
+    callback change-scale(int);
+    callback toggle-ext-enabled(bool);
+    callback change-ext-mode(int);
+    callback change-ext-pos(int);
+
+    callback change-out-vol(int);
+    callback toggle-out-mute(bool);
+    callback change-mic-vol(int);
+    callback toggle-mic-mute(bool);
+    callback select-audio-node(int);
+
+    callback toggle-dnd(bool);
+    callback send-test-notif();
+    callback toggle-dnd-fullscreen(bool);
+    callback toggle-dnd-schedule(bool);
+    callback change-dnd-start(int);
+    callback change-dnd-end(int);
+    callback change-banner-timeout(int);
+    callback change-lock-notif-mode(int);
+    callback toggle-app-notif(string, bool);
+
+    callback toggle-bypass(bool);
+    callback change-profile(int);
+    callback change-lock-timeout(int);
+    callback change-suspend-timeout(int);
+
+    callback toggle-pen-corners(bool);
+    callback toggle-pen-orb(bool);
+    callback toggle-tp-tap(bool);
+    callback toggle-tp-natural(bool);
+    callback change-tp-speed(int);
+    callback toggle-osk-auto-popup(bool);
+    callback change-osk-mode(int);
+    callback toggle-osk-sound(bool);
+    callback change-osk-sound-style(int);
+    callback toggle-kb-caps-ctrl(bool);
+    callback change-ime-trigger(int);
+    callback show-hotkey-overlay();
+
+    callback toggle-ntp(bool);
+    callback change-tz(int);
+    callback change-lang(int);
+    callback change-default-browser(int);
+    callback change-default-pdf(int);
+    callback change-default-image(int);
+    callback change-default-media(int);
+    callback submit-password-change(string, string, string);
+    callback submit-hostname(string);
+    callback open-storage-analyzer();
+    callback confirm-reboot-android();
+
+    pure function page-title(id: string) -> string {
+        if (id == "wifi") { return "无线局域网"; }
+        if (id == "bt") { return "蓝牙"; }
+        if (id == "display") { return "显示与外观"; }
+        if (id == "sound") { return "声音"; }
+        if (id == "notif") { return "通知与专注"; }
+        if (id == "power") { return "电池与电源"; }
+        if (id == "pen") { return "手写笔与键鼠"; }
+        return "系统与关于";
+    }
+
+    public function switch-to-page(id: string) {
+        self.save-current-scroll();
+        root.active-page = id;
+        root.drill = true;
+        self.restore-current-scroll();
+        root.page-selected(id);
+    }
+
+    function save-current-scroll() {
+        if (root.active-page == "wifi") { root.scroll-wifi = detail-flick.content-y; }
+        if (root.active-page == "bt") { root.scroll-bt = detail-flick.content-y; }
+        if (root.active-page == "display") { root.scroll-display = detail-flick.content-y; }
+        if (root.active-page == "sound") { root.scroll-sound = detail-flick.content-y; }
+        if (root.active-page == "notif") { root.scroll-notif = detail-flick.content-y; }
+        if (root.active-page == "power") { root.scroll-power = detail-flick.content-y; }
+        if (root.active-page == "pen") { root.scroll-pen = detail-flick.content-y; }
+        if (root.active-page == "sys") { root.scroll-sys = detail-flick.content-y; }
+    }
+
+    function restore-current-scroll() {
+        if (root.active-page == "wifi") { detail-flick.content-y = root.scroll-wifi; }
+        if (root.active-page == "bt") { detail-flick.content-y = root.scroll-bt; }
+        if (root.active-page == "display") { detail-flick.content-y = root.scroll-display; }
+        if (root.active-page == "sound") { detail-flick.content-y = root.scroll-sound; }
+        if (root.active-page == "notif") { detail-flick.content-y = root.scroll-notif; }
+        if (root.active-page == "power") { detail-flick.content-y = root.scroll-power; }
+        if (root.active-page == "pen") { detail-flick.content-y = root.scroll-pen; }
+        if (root.active-page == "sys") { detail-flick.content-y = root.scroll-sys; }
+    }
+
+    function commit-picker(idx: int) {
+        let k = root.picker-kind;
+        root.picker-kind = "";
+        if (k == "presets") { root.change-presets(idx); }
+        else if (k == "ext-mode") { root.change-ext-mode(idx); }
+        else if (k == "local-wall") { root.select-local-wallpaper(idx); }
+        else if (k == "dnd-start") { root.change-dnd-start(idx); }
+        else if (k == "dnd-end") { root.change-dnd-end(idx); }
+        else if (k == "lock-notif") { root.change-lock-notif-mode(idx); }
+        else if (k == "lock") { root.change-lock-timeout(idx); }
+        else if (k == "suspend") { root.change-suspend-timeout(idx); }
+        else if (k == "ime-trigger") { root.change-ime-trigger(idx); }
+        else if (k == "tz") { root.change-tz(idx); }
+        else if (k == "lang") { root.change-lang(idx); }
+        else if (k == "def-browser") { root.change-default-browser(idx); }
+        else if (k == "def-pdf") { root.change-default-pdf(idx); }
+        else if (k == "def-image") { root.change-default-image(idx); }
+        else if (k == "def-media") { root.change-default-media(idx); }
+    }
+
+    changed light-skin => {
+        Theme.light = root.light-skin;
+    }
+
+    changed accent-idx => {
+        Theme.accent-idx = root.accent-idx;
+    }
+
+    key-scope := FocusScope {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+
+        key-pressed(event) => {
+            if (event.text == "/" || (event.modifiers.control && (event.text == "f" || event.text == "F"))) {
+                if (root.is-single && root.drill) {
+                    root.save-current-scroll();
+                    root.drill = false;
+                }
+                search-field.focus-input();
+                return accept;
+            }
+            if (event.text == Key.Escape) {
+                if (root.picker-kind != "") {
+                    root.picker-kind = "";
+                    return accept;
+                }
+                if (root.modal-kind != "") {
+                    if (root.modal-kind == "bt-pair") {
+                        root.bt-confirm-pair(false);
+                    }
+                    root.modal-kind = "";
+                    return accept;
+                }
+                if (root.search-query != "") {
+                    root.search-query = "";
+                    root.search-edited("");
+                    key-scope.focus();
+                    return accept;
+                }
+                if (root.is-single && root.drill) {
+                    root.save-current-scroll();
+                    root.drill = false;
+                    return accept;
+                }
+            }
+            if (event.modifiers.alt && event.text == Key.LeftArrow && root.is-single && root.drill) {
+                root.save-current-scroll();
+                root.drill = false;
+                return accept;
+            }
+            if (root.search-hits.length > 0 && event.text == Key.DownArrow) {
+                root.search-sel = Math.mod(root.search-sel + 1, root.search-hits.length);
+                return accept;
+            }
+            if (root.search-hits.length > 0 && event.text == Key.UpArrow) {
+                root.search-sel = Math.mod(root.search-sel + root.search-hits.length - 1, root.search-hits.length);
+                return accept;
+            }
+            if (root.search-hits.length > 0 && event.text == Key.Return) {
+                let hit = root.search-hits[root.search-sel];
+                root.search-query = "";
+                root.search-edited("");
+                root.switch-to-page(hit.page-id);
+                root.activate-search-hit(hit);
+                key-scope.focus();
+                return accept;
+            }
+            return reject;
+        }
+
+        // Mouse side Back button anywhere in window
+        TouchArea {
+            width: 100%;
+            height: 100%;
+            pointer-event(ev) => {
+                if (ev.kind == PointerEventKind.up && ev.button == PointerEventButton.back && root.is-single && root.drill) {
+                    root.save-current-scroll();
+                    root.drill = false;
+                }
+            }
+        }
+
+        HorizontalLayout {
+            x: 0px;
+            y: 0px;
+            width: 100%;
+            height: 100%;
+
+            // ================= LEFT SIDEBAR (or Single-Column Index) =================
+            Rectangle {
+                property <bool> show-side: !root.is-single || !root.drill;
+                visible: self.show-side;
+                clip: true;
+                width: !self.show-side ? 0px : (root.is-single ? root.width : (root.is-wide ? 240px : 220px));
+                background: root.is-single
+                    ? @linear-gradient(155deg, Theme.win-bg-top 0%, Theme.win-bg-bot 100%)
+                    : @linear-gradient(180deg, Theme.side-bg 0%, Theme.side-bg-bot 100%);
+
+                VerticalLayout {
+                    padding-left: root.is-single ? 20px : 12px;
+                    padding-right: root.is-single ? 20px : 12px;
+                    padding-top: 16px;
+                    padding-bottom: 12px;
+                    spacing: 10px;
+
+                    // Device Header (tinted dynamically with Theme.accent)
+                    HorizontalLayout {
+                        padding-left: 6px;
+                        padding-right: 6px;
+                        padding-bottom: 4px;
+                        spacing: 11px;
+                        Rectangle {
+                            width: 40px;
+                            height: 40px;
+                            border-radius: 12px;
+                            background: @linear-gradient(145deg, Theme.accent-hover 0%, Theme.accent 100%);
+                            Image {
+                                width: 21px;
+                                height: 21px;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                source: Icons.tablet;
+                                colorize: #ffffff;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 2px;
+                            Text {
+                                text: "Yoga Pad Pro 12.7";
+                                font-size: 13.8px;
+                                font-weight: 700;
+                                color: Theme.ink;
+                            }
+                            Text {
+                                text: root.device-subtitle;
+                                font-size: 11.5px;
+                                color: Theme.sub;
+                            }
+                        }
+                    }
+
+                    // Custom Sleek Search Field (`/` or `Ctrl+F`)
+                    search-field := SearchField {
+                        text <=> root.search-query;
+                        edited(txt) => {
+                            root.search-sel = 0;
+                            root.search-edited(txt);
+                        }
+                        cleared => {
+                            root.search-sel = 0;
+                            root.search-edited("");
+                        }
+                    }
+
+                    // Search Results List (compact top-aligned)
+                    if root.search-query != "" : Flickable {
+                        vertical-stretch: 1;
+                        content-height: sr-lay.preferred-height;
+                        sr-lay := VerticalLayout {
+                            alignment: start;
+                            spacing: 4px;
+                            if root.search-hits.length == 0 : Rectangle {
+                                height: 52px;
+                                Text {
+                                    text: "未找到匹配的设置项";
+                                    font-size: 13px;
+                                    color: Theme.sub;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            for hit[idx] in root.search-hits : Rectangle {
+                                height: 48px;
+                                border-radius: 10px;
+                                background: idx == root.search-sel || hit-ta.has-hover ? Theme.accent-soft : Theme.card-bg;
+                                hit-ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        root.search-query = "";
+                                        root.search-edited("");
+                                        root.switch-to-page(hit.page-id);
+                                        root.activate-search-hit(hit);
+                                    }
+                                }
+                                HorizontalLayout {
+                                    padding-left: 12px;
+                                    padding-right: 12px;
+                                    spacing: 8px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 2px;
+                                        horizontal-stretch: 1;
+                                        Text { text: hit.title; font-size: 13.5px; font-weight: 600; color: Theme.ink; overflow: elide; }
+                                        Text { text: hit.page-label; font-size: 11.5px; color: Theme.sub; }
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Image {
+                                            width: 14px; height: 14px;
+                                            source: Icons.chev-right;
+                                            colorize: Theme.sub;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Category Navigation (alignment: start prevents vertical stretching!)
+                    if root.search-query == "" : Flickable {
+                        vertical-stretch: 1;
+                        content-height: nav-lay.preferred-height;
+                        nav-lay := VerticalLayout {
+                            alignment: start;
+                            spacing: root.is-single ? 6px : 3px;
+                            NavItem {
+                                icon: Icons.wifi;
+                                label: "无线局域网";
+                                summary: root.sum-wifi;
+                                active: root.active-page == "wifi";
+                                single-mode: root.is-single;
+                                clicked => { root.switch-to-page("wifi"); }
+                            }
+                            NavItem {
+                                icon: Icons.bt;
+                                label: "蓝牙";
+                                summary: root.sum-bt;
+                                active: root.active-page == "bt";
+                                single-mode: root.is-single;
+                                clicked => { root.switch-to-page("bt"); }
+                            }
+                            NavItem {
+                                icon: Icons.display;
+                                label: "显示与外观";
+                                summary: root.sum-display;
+                                active: root.active-page == "display";
+                                single-mode: root.is-single;
+                                clicked => { root.switch-to-page("display"); }
+                            }
+                            NavItem {
+                                icon: Icons.sound;
+                                label: "声音";
+                                summary: root.sum-sound;
+                                active: root.active-page == "sound";
+                                single-mode: root.is-single;
+                                clicked => { root.switch-to-page("sound"); }
+                            }
+                            NavItem {
+                                icon: Icons.bell;
+                                label: "通知与专注";
+                                summary: root.sum-notif;
+                                active: root.active-page == "notif";
+                                single-mode: root.is-single;
+                                clicked => { root.switch-to-page("notif"); }
+                            }
+                            NavItem {
+                                icon: Icons.battery;
+                                label: "电池与电源";
+                                summary: root.sum-power;
+                                active: root.active-page == "power";
+                                single-mode: root.is-single;
+                                clicked => { root.switch-to-page("power"); }
+                            }
+                            NavItem {
+                                icon: Icons.pen;
+                                label: "手写笔与键鼠";
+                                summary: root.sum-pen;
+                                active: root.active-page == "pen";
+                                single-mode: root.is-single;
+                                clicked => { root.switch-to-page("pen"); }
+                            }
+                            NavItem {
+                                icon: Icons.gear;
+                                label: "系统与关于";
+                                summary: root.sum-sys;
+                                active: root.active-page == "sys";
+                                single-mode: root.is-single;
+                                clicked => { root.switch-to-page("sys"); }
+                            }
+                        }
+                    }
+                }
+
+                if !root.is-single : Rectangle {
+                    x: parent.width - 1px;
+                    width: 1px;
+                    height: 100%;
+                    background: @linear-gradient(180deg, Theme.glass-border 0%, Theme.line 100%);
+                }
+            }
+
+            // ================= RIGHT DETAIL PANE =================
+            Rectangle {
+                property <bool> show-detail: !root.is-single || root.drill;
+                visible: self.show-detail;
+                clip: true;
+                horizontal-stretch: self.show-detail ? 1 : 0;
+                width: self.show-detail ? (root.is-single ? root.width : (root.width - (root.is-wide ? 240px : 220px))) : 0px;
+                background: @linear-gradient(155deg, Theme.win-bg-top 0%, Theme.win-bg-bot 100%);
+
+                VerticalLayout {
+                    width: 100%;
+                    height: 100%;
+
+                    // Page Header (centered to 810px in wide mode > 1150px)
+                    HorizontalLayout {
+                        padding-top: root.is-single ? 14px : 20px;
+                        padding-bottom: 10px;
+                        padding-left: root.is-wide ? Math.max(26px, (parent.width - 810px) / 2) : (root.is-single ? 20px : 26px);
+                        padding-right: 26px;
+                        spacing: 10px;
+                        alignment: start;
+
+                        if root.is-single : PillButton {
+                            has-lead-icon: true;
+                            lead-icon: Icons.back;
+                            text: "设置";
+                            clicked => {
+                                root.save-current-scroll();
+                                root.drill = false;
+                            }
+                        }
+
+                        VerticalLayout {
+                            alignment: center;
+                            Text {
+                                text: root.page-title(root.active-page);
+                                font-size: 21px;
+                                font-weight: 700;
+                                color: Theme.ink;
+                            }
+                        }
+                    }
+
+                    // Kinetic Touch + Smooth Wheel Flickable
+                    Rectangle {
+                        vertical-stretch: 1;
+                        clip: true;
+
+                        detail-flick := Flickable {
+                            width: 100%;
+                            height: 100%;
+                            interactive: true;
+                            content-width: self.width;
+                            content-height: detail-inner.preferred-height;
+
+                            detail-inner := VerticalLayout {
+                                alignment: start;
+                                padding-top: 4px;
+                                padding-bottom: 32px;
+                                padding-left: root.is-wide ? Math.max(26px, (detail-flick.width - 810px) / 2) : (root.is-single ? 20px : 26px);
+                                padding-right: root.is-wide ? Math.max(26px, (detail-flick.width - 810px) / 2) : (root.is-single ? 20px : 26px);
+
+                                if root.active-page == "wifi" : WifiPage {
+                                    wifi-enabled: root.wifi-enabled;
+                                    airplane-mode: root.airplane-mode;
+                                    wired-summary: root.wired-summary;
+                                    scanning: root.wifi-scanning;
+                                    has-active: root.wifi-has-active;
+                                    active-ssid: root.wifi-active-ssid;
+                                    active-detail: root.wifi-active-detail;
+                                    networks: root.wifi-networks;
+                                    pulse-tag: root.pulse-tag;
+                                    toggle-wifi(v) => { root.toggle-wifi(v); }
+                                    toggle-airplane(v) => { root.toggle-airplane(v); }
+                                    rescan => { root.wifi-rescan(); }
+                                    forget-active(s) => { root.wifi-forget(s); }
+                                    select-network(n) => { root.wifi-select(n); }
+                                }
+
+                                if root.active-page == "bt" : BtPage {
+                                    bt-enabled: root.bt-enabled;
+                                    discovering: root.bt-discovering;
+                                    paired: root.bt-paired;
+                                    discovered: root.bt-discovered;
+                                    pulse-tag: root.pulse-tag;
+                                    toggle-bt(v) => { root.toggle-bt(v); }
+                                    toggle-scan(v) => { root.bt-toggle-scan(v); }
+                                    connect-or-disconnect(d) => { root.bt-connect-or-disconnect(d); }
+                                    forget-device(d) => { root.bt-forget(d); }
+                                    pair-device(d) => { root.bt-pair(d); }
+                                }
+
+                                if root.active-page == "display" : DisplayPage {
+                                    shell-online: root.shell-online;
+                                    skin-idx: root.skin-idx;
+                                    accent-idx: root.accent-idx;
+                                    accent-label: root.accent-label;
+                                    wallpaper-preset-idx: root.wallpaper-preset-idx;
+                                    wallpaper-label: root.wallpaper-label;
+                                    brightness <=> root.brightness;
+                                    autobright: root.autobright;
+                                    hbm-idx: root.hbm-idx;
+                                    night-light: root.night-light;
+                                    reading-mode: root.reading-mode;
+                                    dsi-hdr: root.dsi-hdr;
+                                    high-refresh: root.high-refresh;
+                                    auto-rotate: root.auto-rotate;
+                                    presets-label: root.presets-label;
+                                    scale-idx: root.scale-idx;
+                                    scale-value-text: root.scale-value-text;
+                                    logical-res-text: root.logical-res-text;
+                                    ext-connected: root.ext-connected;
+                                    ext-name: root.ext-name;
+                                    ext-enabled: root.ext-enabled;
+                                    ext-mode-label: root.ext-mode-label;
+                                    ext-pos-idx: root.ext-pos-idx;
+                                    pulse-tag: root.pulse-tag;
+                                    change-skin(i) => { root.change-skin(i); }
+                                    change-accent(i) => { root.change-accent(i); }
+                                    select-wallpaper-preset(i) => { root.select-wallpaper-preset(i); }
+                                    open-local-wallpaper-picker => {
+                                        root.refresh-local-wallpapers();
+                                        root.picker-kind = "local-wall";
+                                        root.picker-title = "选择本地壁纸";
+                                        root.picker-items = root.local-wall-labels;
+                                        root.picker-selected = -1;
+                                    }
+                                    open-custom-wallpaper-modal => {
+                                        root.modal-kind = "custom-wall";
+                                        root.modal-title = "自定义壁纸路径";
+                                        root.modal-subtitle = "输入本地 PNG 或 JPG 图片路径";
+                                        root.modal-input = "~/Pictures/";
+                                    }
+                                    change-brightness(v) => { root.change-brightness(v); }
+                                    toggle-autobright(v) => { root.toggle-autobright(v); }
+                                    change-hbm(i) => { root.change-hbm(i); }
+                                    toggle-night-light(v) => { root.toggle-night-light(v); }
+                                    toggle-reading-mode(v) => { root.toggle-reading-mode(v); }
+                                    toggle-dsi-hdr(v) => { root.toggle-dsi-hdr(v); }
+                                    toggle-high-refresh(v) => { root.toggle-high-refresh(v); }
+                                    toggle-auto-rotate(v) => { root.toggle-auto-rotate(v); }
+                                    open-presets-picker => {
+                                        root.picker-kind = "presets";
+                                        root.picker-title = "分栏宽度预设";
+                                        root.picker-items = [
+                                            "33% · 50% · 67% · 100%",
+                                            "25% · 50% · 75% · 100%",
+                                            "50% · 100%"
+                                        ];
+                                        root.picker-selected = root.presets-idx;
+                                    }
+                                    change-scale(i) => { root.change-scale(i); }
+                                    toggle-ext-enabled(v) => { root.toggle-ext-enabled(v); }
+                                    open-ext-mode-picker => {
+                                        root.picker-kind = "ext-mode";
+                                        root.picker-title = "分辨率与刷新率";
+                                        root.picker-items = root.ext-modes;
+                                        root.picker-selected = root.ext-mode-idx;
+                                    }
+                                    change-ext-pos(i) => { root.change-ext-pos(i); }
+                                }
+
+                                if root.active-page == "sound" : SoundPage {
+                                    out-vol <=> root.out-vol;
+                                    out-muted: root.out-muted;
+                                    mic-vol <=> root.mic-vol;
+                                    mic-muted: root.mic-muted;
+                                    sinks: root.audio-sinks;
+                                    sources: root.audio-sources;
+                                    pulse-tag: root.pulse-tag;
+                                    change-out-vol(v) => { root.change-out-vol(v); }
+                                    toggle-out-mute(v) => { root.toggle-out-mute(v); }
+                                    change-mic-vol(v) => { root.change-mic-vol(v); }
+                                    toggle-mic-mute(v) => { root.toggle-mic-mute(v); }
+                                    select-node(id) => { root.select-audio-node(id); }
+                                }
+
+                                if root.active-page == "notif" : NotifPage {
+                                    shell-online: root.shell-online;
+                                    dnd: root.dnd;
+                                    dnd-fullscreen: root.dnd-fullscreen;
+                                    dnd-schedule-enabled: root.dnd-schedule-enabled;
+                                    dnd-start-label: root.dnd-start-label;
+                                    dnd-end-label: root.dnd-end-label;
+                                    banner-timeout-idx: root.banner-timeout-idx;
+                                    lock-notif-label: root.lock-notif-label;
+                                    notif-apps: root.notif-apps;
+                                    pulse-tag: root.pulse-tag;
+                                    toggle-dnd(v) => { root.toggle-dnd(v); }
+                                    send-test-notif => { root.send-test-notif(); }
+                                    toggle-dnd-fullscreen(v) => { root.toggle-dnd-fullscreen(v); }
+                                    toggle-dnd-schedule(v) => { root.toggle-dnd-schedule(v); }
+                                    open-dnd-start-picker => {
+                                        root.picker-kind = "dnd-start";
+                                        root.picker-title = "开始时间";
+                                        root.picker-items = ["22:00", "23:00", "00:00", "12:30"];
+                                        root.picker-selected = root.dnd-start-idx;
+                                    }
+                                    open-dnd-end-picker => {
+                                        root.picker-kind = "dnd-end";
+                                        root.picker-title = "结束时间";
+                                        root.picker-items = ["07:00", "07:30", "08:30", "14:00"];
+                                        root.picker-selected = root.dnd-end-idx;
+                                    }
+                                    change-banner-timeout(i) => { root.change-banner-timeout(i); }
+                                    open-lock-notif-picker => {
+                                        root.picker-kind = "lock-notif";
+                                        root.picker-title = "锁屏通知显示";
+                                        root.picker-items = [
+                                            "显示完整内容",
+                                            "隐藏通知内容",
+                                            "不显示通知"
+                                        ];
+                                        root.picker-selected = root.lock-notif-idx;
+                                    }
+                                    toggle-app-notif(name, en) => { root.toggle-app-notif(name, en); }
+                                }
+
+                                if root.active-page == "power" : PowerPage {
+                                    battery-pct: root.battery-pct;
+                                    battery-headline: root.battery-headline;
+                                    battery-detail: root.battery-detail;
+                                    bypass-enabled: root.bypass-enabled;
+                                    bypass-active: root.bypass-active;
+                                    profile-idx: root.profile-idx;
+                                    lock-label: root.lock-label;
+                                    suspend-label: root.suspend-label;
+                                    suspend-logs: root.suspend-logs;
+                                    pulse-tag: root.pulse-tag;
+                                    toggle-bypass(v) => { root.toggle-bypass(v); }
+                                    change-profile(i) => { root.change-profile(i); }
+                                    open-lock-picker => {
+                                        root.picker-kind = "lock";
+                                        root.picker-title = "空闲自动锁屏时间";
+                                        root.picker-items = ["1 分钟", "2 分钟", "5 分钟", "10 分钟", "永不"];
+                                        root.picker-selected = root.lock-idx;
+                                    }
+                                    open-suspend-picker => {
+                                        root.picker-kind = "suspend";
+                                        root.picker-title = "空闲自动休眠时间";
+                                        root.picker-items = ["不自动休眠", "5 分钟", "10 分钟", "30 分钟"];
+                                        root.picker-selected = root.suspend-idx;
+                                    }
+                                }
+
+                                if root.active-page == "pen" : PenPage {
+                                    shell-online: root.shell-online;
+                                    pen-status-text: root.pen-status-text;
+                                    pen-badge-text: root.pen-badge-text;
+                                    pen-corners: root.pen-corners;
+                                    pen-orb: root.pen-orb;
+                                    tp-tap: root.tp-tap;
+                                    tp-natural: root.tp-natural;
+                                    tp-speed <=> root.tp-speed;
+                                    osk-auto-popup: root.osk-auto-popup;
+                                    osk-mode-idx: root.osk-mode-idx;
+                                    osk-sound-on: root.osk-sound-on;
+                                    osk-sound-idx: root.osk-sound-idx;
+                                    kb-caps-ctrl: root.kb-caps-ctrl;
+                                    ime-trigger-label: root.ime-trigger-label;
+                                    pulse-tag: root.pulse-tag;
+                                    toggle-pen-corners(v) => { root.toggle-pen-corners(v); }
+                                    toggle-pen-orb(v) => { root.toggle-pen-orb(v); }
+                                    toggle-tp-tap(v) => { root.toggle-tp-tap(v); }
+                                    toggle-tp-natural(v) => { root.toggle-tp-natural(v); }
+                                    change-tp-speed(v) => { root.change-tp-speed(v); }
+                                    toggle-osk-auto-popup(v) => { root.toggle-osk-auto-popup(v); }
+                                    change-osk-mode(i) => { root.change-osk-mode(i); }
+                                    toggle-osk-sound(v) => { root.toggle-osk-sound(v); }
+                                    change-osk-sound-style(i) => { root.change-osk-sound-style(i); }
+                                    toggle-kb-caps-ctrl(v) => { root.toggle-kb-caps-ctrl(v); }
+                                    open-ime-trigger-picker => {
+                                        root.picker-kind = "ime-trigger";
+                                        root.picker-title = "输入法切换快捷键";
+                                        root.picker-items = [
+                                            "Ctrl + Space",
+                                            "左 Shift",
+                                            "Super + Space"
+                                        ];
+                                        root.picker-selected = root.ime-trigger-idx;
+                                    }
+                                    show-hotkey-overlay => { root.show-hotkey-overlay(); }
+                                }
+
+                                if root.active-page == "sys" : SysPage {
+                                    ntp-enabled: root.ntp-enabled;
+                                    current-tz: root.current-tz;
+                                    lang-label: root.lang-label;
+                                    default-browser-label: root.default-browser-label;
+                                    default-pdf-label: root.default-pdf-label;
+                                    default-image-label: root.default-image-label;
+                                    default-media-label: root.default-media-label;
+                                    current-user: root.current-user;
+                                    hostname: root.hostname;
+                                    kernel: root.kernel;
+                                    os-pretty: root.os-pretty;
+                                    ram-gb: root.ram-gb;
+                                    storage-summary: root.storage-summary;
+                                    storage-tool-label: root.storage-tool-label;
+                                    boot-switch-ready: root.boot-switch-ready;
+                                    pulse-tag: root.pulse-tag;
+                                    toggle-ntp(v) => { root.toggle-ntp(v); }
+                                    open-tz-picker => {
+                                        root.picker-kind = "tz";
+                                        root.picker-title = "选择系统时区";
+                                        root.picker-items = root.tz-options;
+                                        root.picker-selected = root.tz-idx;
+                                    }
+                                    open-lang-picker => {
+                                        root.picker-kind = "lang";
+                                        root.picker-title = "选择系统语言";
+                                        root.picker-items = ["简体中文 (zh_CN.UTF-8)", "English (en_US.UTF-8)"];
+                                        root.picker-selected = root.lang-idx;
+                                    }
+                                    open-default-browser-picker => {
+                                        if (root.browser-app-names.length > 0) {
+                                            root.picker-kind = "def-browser";
+                                            root.picker-title = "选择默认网页浏览器";
+                                            root.picker-items = root.browser-app-names;
+                                            root.picker-selected = root.browser-app-idx;
+                                        }
+                                    }
+                                    open-default-pdf-picker => {
+                                        if (root.pdf-app-names.length > 0) {
+                                            root.picker-kind = "def-pdf";
+                                            root.picker-title = "选择默认 PDF 阅读器";
+                                            root.picker-items = root.pdf-app-names;
+                                            root.picker-selected = root.pdf-app-idx;
+                                        }
+                                    }
+                                    open-default-image-picker => {
+                                        if (root.image-app-names.length > 0) {
+                                            root.picker-kind = "def-image";
+                                            root.picker-title = "选择默认图片查看器";
+                                            root.picker-items = root.image-app-names;
+                                            root.picker-selected = root.image-app-idx;
+                                        }
+                                    }
+                                    open-default-media-picker => {
+                                        if (root.media-app-names.length > 0) {
+                                            root.picker-kind = "def-media";
+                                            root.picker-title = "选择默认音视频播放器";
+                                            root.picker-items = root.media-app-names;
+                                            root.picker-selected = root.media-app-idx;
+                                        }
+                                    }
+                                    open-password-modal => {
+                                        root.modal-kind = "passwd";
+                                        root.modal-title = "修改登录密码";
+                                        root.modal-subtitle = "验证当前密码后设置至少 4 位新密码";
+                                        root.modal-input = "";
+                                        root.modal-input2 = "";
+                                        root.modal-input3 = "";
+                                    }
+                                    open-hostname-modal => {
+                                        root.modal-kind = "hostname";
+                                        root.modal-title = "修改设备名称";
+                                        root.modal-subtitle = "用于局域网设备识别";
+                                        root.modal-input = root.hostname;
+                                    }
+                                    open-storage-analyzer => { root.open-storage-analyzer(); }
+                                    request-reboot-android => {
+                                        root.modal-kind = "reboot-android";
+                                        root.modal-title = "重启进入 Android？";
+                                        root.modal-subtitle = "本次开机将进入 Android，从 Android 重启后自动回到 Linux。";
+                                    }
+                                }
+                            }
+                        }
+
+                        // Subtle slim custom scroll indicator (only when content overflows)
+                        if detail-flick.content-height > detail-flick.height + 4px : Rectangle {
+                            x: parent.width - 7px;
+                            property <float> vis-ratio: Math.clamp(detail-flick.height / detail-flick.content-height, 0.12, 1.0);
+                            property <length> thumb-h: detail-flick.height * self.vis-ratio;
+                            property <float> pos-ratio: Math.clamp((-detail-flick.content-y) / Math.max(1px, detail-flick.content-height - detail-flick.height), 0.0, 1.0);
+                            y: 4px + (detail-flick.height - self.thumb-h - 8px) * self.pos-ratio;
+                            width: 4px;
+                            height: self.thumb-h;
+                            border-radius: 2px;
+                            background: Theme.tile-hover;
+                        }
+                    }
+                }
+
+                // Left-edge swipe-right gesture zone in single-column drill mode
+                if root.is-single && root.drill : TouchArea {
+                    x: 0px;
+                    y: 64px;
+                    width: 24px;
+                    height: parent.height - 64px;
+                    property <length> start-x: 0px;
+                    pointer-event(ev) => {
+                        if (ev.kind == PointerEventKind.down) {
+                            self.start-x = self.mouse-x;
+                        }
+                        if (ev.kind == PointerEventKind.up && (self.mouse-x - self.start-x) > 56px) {
+                            root.save-current-scroll();
+                            root.drill = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ================= DROPDOWN PICKER POPOVER =================
+        if root.picker-kind != "" : Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #080a0f88;
+
+            TouchArea {
+                width: 100%;
+                height: 100%;
+                clicked => { root.picker-kind = ""; }
+            }
+
+            Rectangle {
+                width: Math.min(380px, root.width - 40px);
+                height: Math.min(root.height - 80px, pk-head.preferred-height + Math.max(54px, pk-list.preferred-height) + 24px);
+                x: (root.width - self.width) / 2;
+                y: (root.height - self.height) / 2;
+                border-radius: 20px;
+                border-width: 1px;
+                border-color: Theme.glass-border;
+                background: @linear-gradient(165deg, Theme.modal-bg 0%, Theme.modal-bg-bot 100%);
+                drop-shadow-blur: 24px;
+                drop-shadow-offset-y: 8px;
+                drop-shadow-color: #00000050;
+                clip: true;
+
+                Rectangle {
+                    x: 20px;
+                    y: 0px;
+                    z: 10;
+                    width: Math.max(0px, parent.width - 40px);
+                    height: 1px;
+                    background: @linear-gradient(90deg, #ffffff00 0%, Theme.glass-specular 50%, #ffffff00 100%);
+                }
+
+                TouchArea { width: 100%; height: 100%; }
+
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 6px;
+
+                    pk-head := HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        padding-top: 4px;
+                        padding-bottom: 6px;
+                        Text {
+                            text: root.picker-title;
+                            font-size: 15px;
+                            font-weight: 700;
+                            color: Theme.ink;
+                        }
+                    }
+
+                    Flickable {
+                        vertical-stretch: 1;
+                        content-height: pk-list.preferred-height;
+                        pk-list := VerticalLayout {
+                            alignment: start;
+                            spacing: 2px;
+                            if root.picker-items.length == 0 : Rectangle {
+                                height: 50px;
+                                Text {
+                                    text: "未在本地目录中找到可用选项";
+                                    font-size: 13px;
+                                    color: Theme.sub;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            for opt[idx] in root.picker-items : Rectangle {
+                                height: 44px;
+                                border-radius: 10px;
+                                background: idx == root.picker-selected ? Theme.accent-soft : (opt-ta.has-hover ? Theme.tile-bg : transparent);
+
+                                opt-ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.commit-picker(idx); }
+                                }
+
+                                HorizontalLayout {
+                                    padding-left: 12px;
+                                    padding-right: 12px;
+                                    spacing: 8px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        horizontal-stretch: 1;
+                                        Text {
+                                            text: opt;
+                                            font-size: 14px;
+                                            font-weight: idx == root.picker-selected ? 700 : 500;
+                                            color: idx == root.picker-selected ? Theme.accent-ink : Theme.ink;
+                                            overflow: elide;
+                                        }
+                                    }
+                                    if idx == root.picker-selected : VerticalLayout {
+                                        alignment: center;
+                                        Image {
+                                            width: 16px;
+                                            height: 16px;
+                                            source: Icons.check;
+                                            colorize: Theme.accent-ink;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ================= MODAL DIALOG OVERLAY =================
+        if root.modal-kind != "" : Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #080a0f96;
+
+            TouchArea {
+                width: 100%;
+                height: 100%;
+                clicked => {
+                    if (root.modal-kind == "bt-pair") {
+                        root.bt-confirm-pair(false);
+                    }
+                    root.modal-kind = "";
+                }
+            }
+
+            Rectangle {
+                width: Math.min(410px, root.width - 40px);
+                height: dlg-lay.preferred-height;
+                x: (root.width - self.width) / 2;
+                y: (root.height - self.height) / 2;
+                border-radius: 22px;
+                border-width: 1px;
+                border-color: Theme.glass-border;
+                background: @linear-gradient(165deg, Theme.modal-bg 0%, Theme.modal-bg-bot 100%);
+                drop-shadow-blur: 26px;
+                drop-shadow-offset-y: 8px;
+                drop-shadow-color: #00000058;
+                clip: true;
+
+                Rectangle {
+                    x: 22px;
+                    y: 0px;
+                    z: 10;
+                    width: Math.max(0px, parent.width - 44px);
+                    height: 1px;
+                    background: @linear-gradient(90deg, #ffffff00 0%, Theme.glass-specular 50%, #ffffff00 100%);
+                }
+
+                TouchArea { width: 100%; height: 100%; }
+
+                dlg-lay := VerticalLayout {
+                    padding: 22px;
+                    spacing: 12px;
+
+                    Text {
+                        text: root.modal-title;
+                        font-size: 17px;
+                        font-weight: 700;
+                        color: Theme.ink;
+                    }
+                    Text {
+                        text: root.modal-subtitle;
+                        font-size: 13px;
+                        color: Theme.sub;
+                        wrap: word-wrap;
+                    }
+
+                    if root.modal-kind == "wifi-pw" || root.modal-kind == "hostname" || root.modal-kind == "custom-wall" : ModalField {
+                        password: root.modal-kind == "wifi-pw";
+                        placeholder: root.modal-kind == "wifi-pw" ? "输入无线网络密码"
+                            : (root.modal-kind == "custom-wall" ? "例如 ~/Pictures/wall.jpg" : "输入主机名");
+                        text <=> root.modal-input;
+                        accepted => {
+                            if (root.modal-kind == "wifi-pw" && root.modal-input != "") {
+                                let ssid = root.modal-passkey;
+                                let pw = root.modal-input;
+                                root.modal-kind = "";
+                                root.wifi-submit-password(ssid, pw);
+                            } else if (root.modal-kind == "hostname" && root.modal-input != "") {
+                                let h = root.modal-input;
+                                root.modal-kind = "";
+                                root.submit-hostname(h);
+                            } else if (root.modal-kind == "custom-wall" && root.modal-input != "") {
+                                let wp = root.modal-input;
+                                root.modal-kind = "";
+                                root.submit-custom-wallpaper(wp);
+                            }
+                        }
+                    }
+
+                    if root.modal-kind == "passwd" : VerticalLayout {
+                        spacing: 9px;
+                        ModalField {
+                            password: true;
+                            placeholder: "输入当前锁屏密码";
+                            text <=> root.modal-input;
+                        }
+                        ModalField {
+                            password: true;
+                            placeholder: "输入新密码（至少 4 位）";
+                            text <=> root.modal-input2;
+                        }
+                        ModalField {
+                            password: true;
+                            placeholder: "再次输入新密码确认";
+                            text <=> root.modal-input3;
+                            accepted => {
+                                let cur = root.modal-input;
+                                let np1 = root.modal-input2;
+                                let np2 = root.modal-input3;
+                                root.modal-kind = "";
+                                root.submit-password-change(cur, np1, np2);
+                            }
+                        }
+                    }
+
+                    if root.modal-kind == "bt-pair" : Rectangle {
+                        height: 54px;
+                        border-radius: 12px;
+                        background: Theme.tile-bg;
+                        Text {
+                            text: root.modal-passkey;
+                            font-size: 26px;
+                            font-weight: 700;
+                            color: Theme.ink;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        alignment: end;
+                        spacing: 10px;
+                        PillButton {
+                            text: "取消";
+                            clicked => {
+                                if (root.modal-kind == "bt-pair") {
+                                    root.bt-confirm-pair(false);
+                                }
+                                root.modal-kind = "";
+                            }
+                        }
+                        PillButton {
+                            text: root.modal-kind == "wifi-pw" ? "连接"
+                                : (root.modal-kind == "bt-pair" ? "确认配对"
+                                : (root.modal-kind == "reboot-android" ? "确认重启" : "保存"));
+                            primary: true;
+                            clicked => {
+                                if (root.modal-kind == "wifi-pw") {
+                                    let ssid = root.modal-passkey;
+                                    let pw = root.modal-input;
+                                    root.modal-kind = "";
+                                    root.wifi-submit-password(ssid, pw);
+                                } else if (root.modal-kind == "bt-pair") {
+                                    root.modal-kind = "";
+                                    root.bt-confirm-pair(true);
+                                } else if (root.modal-kind == "hostname") {
+                                    let h = root.modal-input;
+                                    root.modal-kind = "";
+                                    root.submit-hostname(h);
+                                } else if (root.modal-kind == "custom-wall") {
+                                    let wp = root.modal-input;
+                                    root.modal-kind = "";
+                                    root.submit-custom-wallpaper(wp);
+                                } else if (root.modal-kind == "passwd") {
+                                    let cur = root.modal-input;
+                                    let np1 = root.modal-input2;
+                                    let np2 = root.modal-input3;
+                                    root.modal-kind = "";
+                                    root.submit-password-change(cur, np1, np2);
+                                } else if (root.modal-kind == "reboot-android") {
+                                    root.modal-kind = "";
+                                    root.confirm-reboot-android();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ================= TOAST PILL =================
+        if root.toast-text != "" : Rectangle {
+            y: root.height - 62px;
+            x: (root.width - self.width) / 2;
+            height: 38px;
+            width: toast-lbl.preferred-width + 36px;
+            border-radius: 19px;
+            background: #10141ef0;
+            border-width: 1px;
+            border-color: #ffffff24;
+
+            toast-lbl := Text {
+                text: root.toast-text;
+                font-size: 13px;
+                font-weight: 600;
+                color: #f4f6fb;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}

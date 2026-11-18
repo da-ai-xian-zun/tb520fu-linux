@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: da-ai-xian-zun <163512031+da-ai-xian-zun@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 02:18:07 -0500
+Subject: [PATCH 03/10] selinux: never switch to enforcing at runtime
+
+Clamp sel_write_enforce() so the global mode cannot be flipped to
+enforcing after boot. ZUI's init in the Waydroid container writes
+enforce=1 after loading its policy; the Debian host has no SELinux policy
+and would lock up. The write still returns success so the container's init
+does not abort. enforcing=0 on the built-in command line sets the initial
+permissive mode, and enforcing_set() has only this and the boot-time
+caller, so the guard is complete.
+
+The kernel command line (CONFIG_CMDLINE, CONFIG_CMDLINE_FORCE) selects
+lsm=selinux,landlock,lockdown,yama,loadpin,safesetid,bpf enforcing=0;
+see kernel/configs/. AppArmor is therefore inactive on the host.
+---
+ security/selinux/selinuxfs.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/security/selinux/selinuxfs.c b/security/selinux/selinuxfs.c
+index c7d914769..97eaf9d6b 100644
+--- a/security/selinux/selinuxfs.c
++++ b/security/selinux/selinuxfs.c
+@@ -155,6 +155,19 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
+ 
+ 	new_value = !!scan_value;
+ 
++	/*
++	 * TB520FU Waydroid host-safety guard:
++	 * SELinux enforcing mode is global, not namespaced. ZUI Android init
++	 * in the container may write enforce=1 after loading its policy; that
++	 * would flip the shared mode to enforcing and lock the unlabeled Debian
++	 * host (which has no host SELinux policy). Clamp every write to
++	 * permissive so the real mode can never become enforcing. Boot cmdline
++	 * already sets enforcing=0; this pins it at runtime. The write still
++	 * returns success below so container init does not abort on setenforce.
++	 * Native Android uses its own GKI kernel and is unaffected.
++	 */
++	new_value = false;
++
+ 	old_value = enforcing_enabled();
+ 	if (new_value != old_value) {
+ 		length = avc_has_perm(current_sid(), SECINITSID_SECURITY,

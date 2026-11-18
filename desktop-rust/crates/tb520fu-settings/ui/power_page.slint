@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: GPL-3.0-only
+import { Theme, Icons, SuspendRow } from "theme.slint";
+import { SectionTitle, Card, CardGap, Divider, SwitchRow, SegmentedBar, SelectRow } from "widgets.slint";
+
+export component PowerPage inherits VerticalLayout {
+    in property <int> battery-pct: 90;
+    in property <string> battery-headline: "旁路直供中 · 0.0W";
+    in property <string> battery-detail: "PD 电源直接向主板供电，电芯零充放电流";
+    in property <bool> bypass-enabled: true;
+    in property <bool> bypass-active: true;
+    in property <int> profile-idx: 1;
+    in property <string> lock-label: "5 分钟";
+    in property <string> suspend-label: "不自动休眠";
+    in property <[SuspendRow]> suspend-logs: [];
+    in property <string> pulse-tag: "";
+
+    callback toggle-bypass(bool);
+    callback change-profile(int);
+    callback open-lock-picker();
+    callback open-suspend-picker();
+
+    spacing: 0px;
+
+    Card {
+        HorizontalLayout {
+            padding: 18px;
+            spacing: 18px;
+            alignment: start;
+
+            Rectangle {
+                width: 78px;
+                height: 78px;
+                border-radius: 39px;
+                border-width: 7px;
+                border-color: root.bypass-active ? Theme.green : Theme.accent;
+                background: transparent;
+
+                Text {
+                    text: root.battery-pct + "%";
+                    font-size: 18px;
+                    font-weight: 700;
+                    color: Theme.ink;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 4px;
+                horizontal-stretch: 1;
+                Text {
+                    text: root.battery-headline;
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Theme.ink;
+                }
+                if root.battery-detail != "" : Text {
+                    text: root.battery-detail;
+                    font-size: 12.5px;
+                    color: Theme.sub;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+    CardGap {}
+
+    Card {
+        pulse: root.pulse-tag == "bypass";
+        SwitchRow {
+            has-icon: true;
+            icon: Icons.battery;
+            title: "90% 旁路供电";
+            subtitle: "充至 90% 后直接供电，延缓电池老化";
+            checked: root.bypass-enabled;
+            toggled(v) => { root.toggle-bypass(v); }
+        }
+    }
+
+    SectionTitle { text: "性能模式"; }
+    Card {
+        pulse: root.pulse-tag == "profile";
+        VerticalLayout {
+            padding: 14px;
+            spacing: 9px;
+            SegmentedBar {
+                labels: ["省电", "均衡", "性能"];
+                selected: root.profile-idx;
+                changed(i) => { root.change-profile(i); }
+            }
+            Text {
+                text: root.profile-idx == 0 ? "降低峰值功耗，延长离电续航"
+                    : (root.profile-idx == 2 ? "释放峰值算力，适合编译与重负载任务" : "日常流畅高刷，按负载自动调节");
+                font-size: 12.5px;
+                color: Theme.sub;
+            }
+        }
+    }
+
+    SectionTitle { text: "自动锁屏与休眠"; }
+    Card {
+        pulse: root.pulse-tag == "idle";
+        VerticalLayout {
+            SelectRow {
+                has-icon: true;
+                icon: Icons.lock;
+                title: "空闲自动锁屏";
+                value-text: root.lock-label;
+                open-picker => { root.open-lock-picker(); }
+            }
+            Divider {}
+            SelectRow {
+                has-icon: true;
+                icon: Icons.moon;
+                title: "空闲自动休眠";
+                value-text: root.suspend-label;
+                open-picker => { root.open-suspend-picker(); }
+            }
+        }
+    }
+
+    SectionTitle { text: "休眠功耗记录"; }
+    Card {
+        pulse: root.pulse-tag == "suslog";
+        VerticalLayout {
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 10px;
+                padding-bottom: 10px;
+                Text { width: 115px; text: "休眠时间"; font-size: 12px; font-weight: 600; color: Theme.sub; }
+                Text { horizontal-stretch: 1; text: "持续时长"; font-size: 12px; font-weight: 600; color: Theme.sub; }
+                Text { width: 140px; text: "电量变化"; font-size: 12px; font-weight: 600; color: Theme.sub; }
+                Text { width: 130px; text: "平均功耗"; font-size: 12px; font-weight: 600; color: Theme.sub; horizontal-alignment: right; }
+            }
+
+            if root.suspend-logs.length == 0 : VerticalLayout {
+                Divider {}
+                Rectangle {
+                    min-height: 48px;
+                    Text {
+                        text: "暂无休眠记录";
+                        font-size: 12.5px;
+                        color: Theme.sub;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            for item in root.suspend-logs : VerticalLayout {
+                Divider {}
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    padding-top: 10px;
+                    padding-bottom: 10px;
+                    Text { width: 115px; text: item.started; font-size: 13px; color: Theme.ink; }
+                    Text { horizontal-stretch: 1; text: item.duration; font-size: 13px; color: Theme.ink; }
+                    Text { width: 140px; text: item.delta-cap; font-size: 13px; color: Theme.ink; }
+                    Text { width: 130px; text: item.avg-power; font-size: 13px; color: Theme.sub; horizontal-alignment: right; }
+                }
+            }
+        }
+    }
+    CardGap {}
+}

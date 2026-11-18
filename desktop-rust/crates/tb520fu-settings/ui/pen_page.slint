@@ -1,0 +1,241 @@
+// SPDX-License-Identifier: GPL-3.0-only
+import { Theme, Icons } from "theme.slint";
+import { SectionTitle, Card, CardGap, Divider, RowIconBadge, SwitchRow, SliderRow, InlineSegRow, SelectRow, PillButton, TagPill, ShortcutBadgeRow } from "widgets.slint";
+
+export component PenPage inherits VerticalLayout {
+    in property <bool> shell-online: true;
+    in property <string> pen-status-text: "使用中";
+    in property <string> pen-badge-text: "就绪";
+    in property <bool> pen-corners: false;
+    in property <bool> pen-orb: false;
+    in property <bool> tp-tap: true;
+    in property <bool> tp-natural: true;
+    in-out property <int> tp-speed: 55;
+    in property <bool> osk-auto-popup: true;
+    in property <int> osk-mode-idx: 0;
+    in property <bool> osk-sound-on: true;
+    in property <int> osk-sound-idx: 0;
+    in property <bool> kb-caps-ctrl: false;
+    in property <string> ime-trigger-label: "Ctrl + Space";
+    in property <string> pulse-tag: "";
+
+    callback toggle-pen-corners(bool);
+    callback toggle-pen-orb(bool);
+    callback toggle-tp-tap(bool);
+    callback toggle-tp-natural(bool);
+    callback change-tp-speed(int);
+    callback toggle-osk-auto-popup(bool);
+    callback change-osk-mode(int);
+    callback toggle-osk-sound(bool);
+    callback change-osk-sound-style(int);
+    callback toggle-kb-caps-ctrl(bool);
+    callback open-ime-trigger-picker();
+    callback show-hotkey-overlay();
+
+    spacing: 0px;
+
+    SectionTitle { text: "Lenovo Tab Pen Pro"; first: true; }
+    Card {
+        pulse: root.pulse-tag == "pen-bat";
+        HorizontalLayout {
+            padding: 15px;
+            spacing: 12px;
+
+            VerticalLayout {
+                alignment: center;
+                RowIconBadge { icon: Icons.pen; active: true; }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 3px;
+                horizontal-stretch: 1;
+                Text {
+                    text: "Lenovo Tab Pen Pro";
+                    font-size: 14.5px;
+                    font-weight: 700;
+                    color: Theme.ink;
+                }
+                Text {
+                    text: root.pen-status-text;
+                    font-size: 12px;
+                    color: Theme.sub;
+                    wrap: word-wrap;
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                TagPill {
+                    text: root.pen-badge-text;
+                    green: true;
+                }
+            }
+        }
+    }
+
+    SectionTitle { text: "手写笔快捷方式"; }
+    Card {
+        pulse: root.pulse-tag == "pen-gest";
+        VerticalLayout {
+            SwitchRow {
+                has-icon: true;
+                icon: Icons.pen;
+                title: "底角上滑手势";
+                subtitle: "从屏幕左下或右下角向内斜滑呼出快捷动作";
+                checked: root.pen-corners;
+                enabled: root.shell-online;
+                toggled(v) => { root.toggle-pen-corners(v); }
+            }
+            Divider {}
+            SwitchRow {
+                has-icon: true;
+                icon: Icons.palette;
+                title: "手写笔悬浮球";
+                subtitle: "取下笔时在屏幕边缘显示批注与速记入口";
+                checked: root.pen-orb;
+                enabled: root.shell-online;
+                toggled(v) => { root.toggle-pen-orb(v); }
+            }
+        }
+    }
+
+    SectionTitle { text: "触控板"; }
+    Card {
+        pulse: root.pulse-tag == "touchpad";
+        VerticalLayout {
+            SwitchRow {
+                has-icon: true;
+                icon: Icons.touchpad;
+                title: "轻触点击";
+                subtitle: "单指轻点为左键，双指轻点为右键";
+                checked: root.tp-tap;
+                toggled(v) => { root.toggle-tp-tap(v); }
+            }
+            Divider {}
+            SwitchRow {
+                has-icon: true;
+                icon: Icons.rotate;
+                title: "自然滚动";
+                subtitle: "滚动方向与触屏手势一致";
+                checked: root.tp-natural;
+                toggled(v) => { root.toggle-tp-natural(v); }
+            }
+            Divider {}
+            SliderRow {
+                has-icon: true;
+                icon: Icons.touchpad;
+                title: "指针速度";
+                minimum: 0;
+                maximum: 100;
+                value <=> root.tp-speed;
+                changed(v) => { root.change-tp-speed(v); }
+            }
+        }
+    }
+
+    SectionTitle { text: "屏幕键盘"; }
+    Card {
+        pulse: root.pulse-tag == "osk";
+        VerticalLayout {
+            SwitchRow {
+                has-icon: true;
+                icon: Icons.keyboard;
+                title: "聚焦输入框自动弹出";
+                subtitle: "未连接实体键盘时点按文本框自动弹出";
+                checked: root.osk-auto-popup;
+                toggled(v) => { root.toggle-osk-auto-popup(v); }
+            }
+            Divider {}
+            InlineSegRow {
+                has-icon: true;
+                icon: Icons.scale;
+                title: "默认形态";
+                subtitle: "双指捏合或张开可随时切换停靠与分裂";
+                labels: ["整块停靠", "三段分裂", "自由悬浮"];
+                selected: root.osk-mode-idx;
+                changed(i) => { root.change-osk-mode(i); }
+            }
+            Divider {}
+            SwitchRow {
+                has-icon: true;
+                icon: Icons.sound;
+                title: "按键音效";
+                checked: root.osk-sound-on;
+                toggled(v) => { root.toggle-osk-sound(v); }
+            }
+            if root.osk-sound-on : VerticalLayout {
+                Divider {}
+                InlineSegRow {
+                    title: "音效风格";
+                    labels: ["清脆标准", "轻柔水滴", "机械微动"];
+                    selected: root.osk-sound-idx;
+                    changed(i) => { root.change-osk-sound-style(i); }
+                }
+            }
+        }
+    }
+
+    SectionTitle { text: "实体键盘与快捷键"; }
+    Card {
+        pulse: root.pulse-tag == "shortcuts" || root.pulse-tag == "ime";
+        VerticalLayout {
+            SwitchRow {
+                has-icon: true;
+                icon: Icons.keyboard;
+                title: "将 Caps Lock 映射为 Ctrl";
+                checked: root.kb-caps-ctrl;
+                toggled(v) => { root.toggle-kb-caps-ctrl(v); }
+            }
+            Divider {}
+            SelectRow {
+                has-icon: true;
+                icon: Icons.globe;
+                title: "输入法切换快捷键";
+                value-text: root.ime-trigger-label;
+                open-picker => { root.open-ime-trigger-picker(); }
+            }
+            Divider {}
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 11px;
+                padding-bottom: 9px;
+                spacing: 12px;
+                VerticalLayout {
+                    alignment: center;
+                    RowIconBadge { icon: Icons.key; }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    Text { text: "系统快捷键"; font-size: 14.5px; font-weight: 600; color: Theme.ink; }
+                    Text { text: "Super 键为键盘左下角徽标键"; font-size: 12px; color: Theme.sub; }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    PillButton {
+                        text: "键位总览";
+                        clicked => { root.show-hotkey-overlay(); }
+                    }
+                }
+            }
+            Divider {}
+            ShortcutBadgeRow { label: "打开控制台与应用列表"; combo: "Super + D / Space"; }
+            Divider {}
+            ShortcutBadgeRow { label: "通知中心 / 控制中心"; combo: "Super + N / A"; }
+            Divider {}
+            ShortcutBadgeRow { label: "截屏批注 / 速记便签"; combo: "Super + Shift + S / N"; }
+            Divider {}
+            ShortcutBadgeRow { label: "显示或收起屏幕键盘"; combo: "Super + K"; }
+            Divider {}
+            ShortcutBadgeRow { label: "工作区总览"; combo: "Super + O"; }
+            Divider {}
+            ShortcutBadgeRow { label: "切换分栏宽度 / 居中 / 关闭窗口"; combo: "Super + R / C / Q"; }
+            Divider {}
+            ShortcutBadgeRow { label: "锁定屏幕"; combo: "Super + L"; }
+        }
+    }
+    CardGap {}
+}

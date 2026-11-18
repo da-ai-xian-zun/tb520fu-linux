@@ -1,0 +1,10 @@
+# The Novatek driver reports no resolution for the pen, and libinput rejects a
+# tablet whose physical size it cannot compute. The panel is about 273 x 171 mm
+# for 29440 x 18400 units, so 108 units/mm. Distance and tilt also exceed the
+# ranges the driver declares (seen: distance 150, tilt 78).
+evdev:name:NVTCapacitivePen:*
+ EVDEV_ABS_00=::108
+ EVDEV_ABS_01=::108
+ EVDEV_ABS_19=0:255
+ EVDEV_ABS_1A=-90:90
+ EVDEV_ABS_1B=-90:90

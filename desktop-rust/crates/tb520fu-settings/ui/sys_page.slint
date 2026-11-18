@@ -1,0 +1,266 @@
+// SPDX-License-Identifier: GPL-3.0-only
+import { Theme, Icons } from "theme.slint";
+import { SectionTitle, Card, CardGap, Divider, RowIconBadge, SwitchRow, SelectRow, PillButton, KeyValueRow } from "widgets.slint";
+
+export component SysPage inherits VerticalLayout {
+    in property <bool> ntp-enabled: true;
+    in property <string> current-tz: "Asia/Shanghai";
+    in property <string> lang-label: "简体中文 (zh_CN.UTF-8)";
+    in property <string> default-browser-label: "—";
+    in property <string> default-pdf-label: "—";
+    in property <string> default-image-label: "—";
+    in property <string> default-media-label: "—";
+    in property <string> current-user: "debian";
+    in property <string> hostname: "yoga-tb520fu";
+    in property <string> kernel: "7.3.3";
+    in property <string> os-pretty: "Debian GNU/Linux 13";
+    in property <string> ram-gb: "16 GB";
+    in property <string> storage-summary: "—";
+    in property <string> storage-tool-label: "";
+    in property <bool> boot-switch-ready: false;
+    in property <string> pulse-tag: "";
+
+    callback toggle-ntp(bool);
+    callback open-tz-picker();
+    callback open-lang-picker();
+    callback open-default-browser-picker();
+    callback open-default-pdf-picker();
+    callback open-default-image-picker();
+    callback open-default-media-picker();
+    callback open-password-modal();
+    callback open-hostname-modal();
+    callback open-storage-analyzer();
+    callback request-reboot-android();
+
+    spacing: 0px;
+
+    SectionTitle { text: "默认应用"; first: true; }
+    Card {
+        pulse: root.pulse-tag == "default-apps";
+        VerticalLayout {
+            SelectRow {
+                has-icon: true;
+                icon: Icons.globe;
+                title: "网页浏览器";
+                value-text: root.default-browser-label;
+                open-picker => { root.open-default-browser-picker(); }
+            }
+            Divider {}
+            SelectRow {
+                has-icon: true;
+                icon: Icons.book;
+                title: "PDF 阅读器";
+                value-text: root.default-pdf-label;
+                open-picker => { root.open-default-pdf-picker(); }
+            }
+            Divider {}
+            SelectRow {
+                has-icon: true;
+                icon: Icons.image;
+                title: "图片查看器";
+                value-text: root.default-image-label;
+                open-picker => { root.open-default-image-picker(); }
+            }
+            Divider {}
+            SelectRow {
+                has-icon: true;
+                icon: Icons.apps;
+                title: "音视频播放器";
+                value-text: root.default-media-label;
+                open-picker => { root.open-default-media-picker(); }
+            }
+        }
+    }
+
+    SectionTitle { text: "账户与安全"; }
+    Card {
+        pulse: root.pulse-tag == "passwd";
+        HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            padding-top: 12px;
+            padding-bottom: 12px;
+            spacing: 12px;
+
+            VerticalLayout {
+                alignment: center;
+                RowIconBadge { icon: Icons.key; active: true; }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 2px;
+                horizontal-stretch: 1;
+                Text {
+                    text: "登录密码";
+                    font-size: 14.5px;
+                    font-weight: 600;
+                    color: Theme.ink;
+                }
+                Text {
+                    text: "当前账户：" + root.current-user;
+                    font-size: 12px;
+                    color: Theme.sub;
+                    wrap: word-wrap;
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                PillButton {
+                    text: "修改密码…";
+                    clicked => { root.open-password-modal(); }
+                }
+            }
+        }
+    }
+
+    SectionTitle { text: "日期、时间与语言"; }
+    Card {
+        pulse: root.pulse-tag == "tz";
+        VerticalLayout {
+            SwitchRow {
+                has-icon: true;
+                icon: Icons.clock;
+                title: "自动设置时间";
+                checked: root.ntp-enabled;
+                toggled(v) => { root.toggle-ntp(v); }
+            }
+            Divider {}
+            SelectRow {
+                has-icon: true;
+                icon: Icons.globe;
+                title: "时区";
+                value-text: root.current-tz;
+                open-picker => { root.open-tz-picker(); }
+            }
+            Divider {}
+            SelectRow {
+                has-icon: true;
+                icon: Icons.globe;
+                title: "系统语言";
+                subtitle: "修改后重新登录生效";
+                value-text: root.lang-label;
+                open-picker => { root.open-lang-picker(); }
+            }
+        }
+    }
+
+    SectionTitle { text: "双系统引导"; }
+    Card {
+        pulse: root.pulse-tag == "boot";
+        HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            padding-top: 12px;
+            padding-bottom: 12px;
+            spacing: 12px;
+
+            VerticalLayout {
+                alignment: center;
+                RowIconBadge { icon: Icons.rotate; active: root.boot-switch-ready; }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 2px;
+                horizontal-stretch: 1;
+                Text {
+                    text: "重启进入 Android";
+                    font-size: 14.5px;
+                    font-weight: 600;
+                    color: Theme.ink;
+                }
+                Text {
+                    text: root.boot-switch-ready
+                        ? "下次开机进入 Android，从 Android 重启后自动回到 Linux"
+                        : "当前可在开机菜单中选择 Android";
+                    font-size: 12px;
+                    color: Theme.sub;
+                    wrap: word-wrap;
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                PillButton {
+                    text: root.boot-switch-ready ? "重启进入 Android" : "未启用";
+                    enabled: root.boot-switch-ready;
+                    clicked => { root.request-reboot-android(); }
+                }
+            }
+        }
+    }
+
+    SectionTitle { text: "关于本机"; }
+    Card {
+        pulse: root.pulse-tag == "about";
+        VerticalLayout {
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 10px;
+                padding-bottom: 10px;
+                spacing: 12px;
+                VerticalLayout {
+                    alignment: center;
+                    RowIconBadge { icon: Icons.tablet; }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    Text { text: "设备名称"; font-size: 14.5px; font-weight: 600; color: Theme.ink; }
+                    Text { text: root.hostname + ".local"; font-size: 12px; color: Theme.sub; }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    PillButton {
+                        text: root.hostname + "  ✎";
+                        clicked => { root.open-hostname-modal(); }
+                    }
+                }
+            }
+            Divider {}
+            KeyValueRow { label: "型号"; value: "Lenovo Yoga Pad Pro 12.7 (TB520FU)"; }
+            Divider {}
+            KeyValueRow { label: "处理器"; value: "Qualcomm Snapdragon 8 Gen 3"; }
+            Divider {}
+            KeyValueRow { label: "内存"; value: root.ram-gb; }
+            Divider {}
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                min-height: 46px;
+                spacing: 12px;
+                VerticalLayout {
+                    alignment: center;
+                    Text { text: "存储空间"; font-size: 13.5px; color: Theme.sub; }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: root.storage-summary;
+                        font-size: 13.5px;
+                        font-weight: 600;
+                        color: Theme.ink;
+                        horizontal-alignment: right;
+                    }
+                }
+                if root.storage-tool-label != "" : VerticalLayout {
+                    alignment: center;
+                    PillButton {
+                        text: root.storage-tool-label;
+                        clicked => { root.open-storage-analyzer(); }
+                    }
+                }
+            }
+            Divider {}
+            KeyValueRow { label: "内核版本"; value: root.kernel; }
+            Divider {}
+            KeyValueRow { label: "系统版本"; value: root.os-pretty + " · Niri 26.04"; }
+        }
+    }
+    CardGap {}
+}

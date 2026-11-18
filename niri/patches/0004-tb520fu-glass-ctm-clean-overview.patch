@@ -1,0 +1,266 @@
+From d995c4b9ea805aed6c0d1f11a1f7622aa756030c Mon Sep 17 00:00:00 2001
+From: da-ai-xian-zun <163512031+da-ai-xian-zun@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 01:49:19 -0500
+Subject: [PATCH] tb520fu: glass-ctm-clean-overview
+
+---
+ src/backend/tty.rs    | 175 ++++++++++++++++++++++++++++++++++++++++++
+ src/layout/monitor.rs |   6 +-
+ 2 files changed, 179 insertions(+), 2 deletions(-)
+
+diff --git a/src/backend/tty.rs b/src/backend/tty.rs
+index 50ef2659..cb9e84a2 100644
+--- a/src/backend/tty.rs
++++ b/src/backend/tty.rs
+@@ -426,6 +426,7 @@ struct Surface {
+     panel_edr: Option<PanelEdr>,
+     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
+     gamma_props: Option<GammaProps>,
++    ctm_props: Option<CtmProps>,
+     /// Gamma change to apply upon session resume.
+     pending_gamma_change: Option<Option<Vec<u16>>>,
+     /// Tracy frame that goes from vblank to vblank.
+@@ -483,6 +484,14 @@ struct GammaProps {
+     previous_blob: Option<NonZeroU64>,
+ }
+ 
++struct CtmProps {
++    crtc: crtc::Handle,
++    ctm: property::Handle,
++    previous_blob: Option<NonZeroU64>,
++    applied_mode: (bool, bool),
++    last_poll: Option<std::time::Instant>,
++}
++
+ /// Read-only snapshot of a connector's DRM properties.
+ struct ConnectorProperties {
+     properties: Vec<(property::Info, property::RawValue)>,
+@@ -782,6 +791,11 @@ impl Tty {
+                                 warn!("error restoring gamma: {err:?}");
+                             }
+                         }
++                        if let Some(ctm_props) = &surface.ctm_props {
++                            if let Err(err) = ctm_props.restore_ctm(&device.drm) {
++                                warn!("error restoring CTM: {err:?}");
++                            }
++                        }
+                     }
+                 }
+ 
+@@ -1408,6 +1422,13 @@ impl Tty {
+             debug!("couldn't reset gamma: {err:?}");
+         }
+ 
++        let mut ctm_props = CtmProps::new(&device.drm, crtc)
++            .map_err(|err| debug!("couldn't get CTM property: {err:?}"))
++            .ok();
++        if let Some(ctm_props) = &mut ctm_props {
++            let _ = ctm_props.apply_mode(&device.drm, false, false);
++        }
++
+         let surface = device
+             .drm
+             .create_surface(crtc, mode, &[connector.handle()])?;
+@@ -1890,6 +1911,7 @@ impl Tty {
+             compositor,
+             dmabuf_feedback,
+             gamma_props,
++            ctm_props,
+             pending_gamma_change: None,
+             vblank_frame: None,
+             vblank_frame_name,
+@@ -2338,6 +2360,10 @@ impl Tty {
+             surface.compositor.reset_buffers();
+         }
+ 
++        if let Some(ctm_props) = &mut surface.ctm_props {
++            ctm_props.sync_from_ctl_if_due(&device.drm);
++        }
++
+         let mut renderer = match self.gpu_manager.renderer(
+             &self.primary_render_node,
+             &device.render_node.unwrap_or(self.primary_render_node),
+@@ -3231,6 +3257,155 @@ impl GammaProps {
+     }
+ }
+ 
++impl CtmProps {
++    fn new(device: &DrmDevice, crtc: crtc::Handle) -> anyhow::Result<Self> {
++        let props = device
++            .get_properties(crtc)
++            .context("error getting CRTC properties")?;
++        let mut ctm = None;
++        for (prop, _) in props {
++            let Ok(info) = device.get_property(prop) else {
++                continue;
++            };
++            let Ok(name) = info.name().to_str() else {
++                continue;
++            };
++            if name == "CTM" {
++                ensure!(
++                    matches!(info.value_type(), property::ValueType::Blob),
++                    "wrong CTM value type"
++                );
++                ctm = Some(prop);
++                break;
++            }
++        }
++        let ctm = ctm.context("missing CTM property")?;
++        Ok(Self {
++            crtc,
++            ctm,
++            previous_blob: None,
++            applied_mode: (false, false),
++            last_poll: None,
++        })
++    }
++
++    #[inline]
++    fn f64_to_drm_s31_32(v: f64) -> u64 {
++        let mag = ((v.abs() * ((1u64 << 32) as f64)).round() as u64) & 0x7FFF_FFFF_FFFF_FFFF;
++        if v < 0.0 {
++            (1u64 << 63) | mag
++        } else {
++            mag
++        }
++    }
++
++    fn apply_mode(
++        &mut self,
++        device: &DrmDevice,
++        night_light: bool,
++        reading_mode: bool,
++    ) -> anyhow::Result<()> {
++        #[allow(non_camel_case_types)]
++        #[repr(C)]
++        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
++        struct drm_color_ctm {
++            matrix: [u64; 9],
++        }
++
++        let blob = if !night_light && !reading_mode {
++            None
++        } else {
++            let base: [[f64; 3]; 3] = if reading_mode {
++                [
++                    [0.2126, 0.7152, 0.0722],
++                    [0.2126, 0.7152, 0.0722],
++                    [0.2126, 0.7152, 0.0722],
++                ]
++            } else {
++                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
++            };
++            let gains = if night_light {
++                [1.0, 0.86, 0.68]
++            } else {
++                [1.0, 1.0, 1.0]
++            };
++            let mut raw = drm_color_ctm { matrix: [0; 9] };
++            for row in 0..3 {
++                for col in 0..3 {
++                    raw.matrix[row * 3 + col] = Self::f64_to_drm_s31_32(base[row][col] * gains[row]);
++                }
++            }
++            let mut slice = [raw];
++            let bytes = cast_slice_mut(&mut slice);
++            let created = drm_ffi::mode::create_property_blob(device.as_fd(), bytes)
++                .context("error creating CTM property blob")?;
++            NonZeroU64::new(u64::from(created.blob_id))
++        };
++
++        let blob_id = blob.map(NonZeroU64::get).unwrap_or(0);
++        device
++            .set_property(self.crtc, self.ctm, property::Value::Blob(blob_id).into())
++            .context("error setting CTM")
++            .inspect_err(|_| {
++                if blob_id != 0 {
++                    let _ = device.destroy_property_blob(blob_id);
++                }
++            })?;
++
++        if let Some(prev) = mem::replace(&mut self.previous_blob, blob) {
++            let _ = device.destroy_property_blob(prev.get());
++        }
++        self.applied_mode = (night_light, reading_mode);
++        Ok(())
++    }
++
++    fn restore_ctm(&self, device: &DrmDevice) -> anyhow::Result<()> {
++        let blob_id = self.previous_blob.map(NonZeroU64::get).unwrap_or(0);
++        device
++            .set_property(self.crtc, self.ctm, property::Value::Blob(blob_id).into())
++            .context("error restoring CTM")?;
++        Ok(())
++    }
++
++    fn sync_from_ctl_if_due(&mut self, device: &DrmDevice) {
++        let now = std::time::Instant::now();
++        if self
++            .last_poll
++            .is_some_and(|t| now.duration_since(t) < Duration::from_millis(120))
++        {
++            return;
++        }
++        self.last_poll = Some(now);
++
++        let path = if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
++            std::path::PathBuf::from(dir).join("tb520fu-display-ctl")
++        } else {
++            let uid = unsafe { libc::getuid() };
++            std::path::PathBuf::from(format!("/run/user/{uid}/tb520fu-display-ctl"))
++        };
++
++        let mut night = false;
++        let mut reading = false;
++        if let Ok(txt) = std::fs::read_to_string(path) {
++            for line in txt.lines() {
++                if let Some((k, v)) = line.split_once('=') {
++                    let on = matches!(v.trim(), "1" | "true" | "on");
++                    match k.trim() {
++                        "night_light" => night = on,
++                        "reading_mode" => reading = on,
++                        _ => {}
++                    }
++                }
++            }
++        }
++        if (night, reading) != self.applied_mode {
++            if let Err(err) = self.apply_mode(device, night, reading) {
++                warn!("error applying TB520FU CTM ({night}, {reading}): {err:?}");
++            }
++        }
++    }
++}
++
+ fn primary_node_from_render_node(path: &Path) -> Option<(DrmNode, DrmNode)> {
+     match DrmNode::from_path(path) {
+         Ok(node) => {
+diff --git a/src/layout/monitor.rs b/src/layout/monitor.rs
+index d71ca55a..fc23cfd9 100644
+--- a/src/layout/monitor.rs
++++ b/src/layout/monitor.rs
+@@ -1735,8 +1735,10 @@ impl<W: LayoutElement> Monitor<W> {
+             }
+ 
+             let xray_pos = XrayPos::new(geo.loc, zoom);
++            let ws_focus_ring =
++                focus_ring && !self.overview_open && self.overview_progress.is_none();
+ 
+-            ws.render_floating(ctx.r(), xray_pos, focus_ring, push!());
++            ws.render_floating(ctx.r(), xray_pos, ws_focus_ring, push!());
+ 
+             if let Some(loc) = insert_hint_render_loc {
+                 if loc.workspace == InsertWorkspace::Existing(ws.id()) {
+@@ -1745,7 +1747,7 @@ impl<W: LayoutElement> Monitor<W> {
+                 }
+             }
+ 
+-            ws.render_scrolling(ctx.r(), xray_pos, focus_ring, push!());
++            ws.render_scrolling(ctx.r(), xray_pos, ws_focus_ring, push!());
+         }
+     }
+ 
+-- 
+2.47.3
+

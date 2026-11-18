@@ -1,0 +1,12 @@
+# TB520FU: the WCN7850 Wi-Fi gets no MAC from firmware, so ath12k picks a random 00:03:7f:12:xx:xx
+# every boot (new DHCP lease, new IP each time). Give it the factory address (Android's wlan0).
+# A matching .link replaces 99-default.link, so its naming policy is repeated here (keeps wlp1s0).
+[Match]
+Path=platform-1c00000.pcie-pci-0000:01:00.0
+Type=wlan
+
+[Link]
+NamePolicy=keep kernel database onboard slot path
+AlternativeNamesPolicy=database onboard slot path mac
+MACAddressPolicy=none
+MACAddress=@WIFI_MAC@

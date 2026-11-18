@@ -1,0 +1,12 @@
+[Unit]
+Description=TB520FU: release boot-time interconnect votes held by never-bound consumers
+After=graphical.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 10
+ExecStart=/usr/local/sbin/tb520fu-icc-sync
+RemainAfterExit=yes
+
+[Install]
+WantedBy=graphical.target

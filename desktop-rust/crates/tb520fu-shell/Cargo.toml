@@ -1,0 +1,18 @@
+[package]
+name = "tb520fu-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tb520fu-ui = { path = "../tb520fu-ui" }
+tb520fu-osk = { path = "../tb520fu-osk" }
+libc.workspace = true
+png.workspace = true
+tiny-skia.workspace = true
+cosmic-text.workspace = true
+tokio.workspace = true
+zbus.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libloading.workspace = true

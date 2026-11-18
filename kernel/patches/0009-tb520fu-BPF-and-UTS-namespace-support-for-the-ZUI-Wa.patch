@@ -1,0 +1,232 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: da-ai-xian-zun <163512031+da-ai-xian-zun@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 03:45:32 -0500
+Subject: [PATCH 09/10] tb520fu: BPF and UTS namespace support for the ZUI
+ Waydroid container
+
+- net/core: mirror net.core.bpf_jit_enable/bpf_jit_kallsyms into every
+  non-init netns (reads report host value, writes are range-checked and
+  dropped). Android U+ netbpfload aborts on ENOENT for these. .data is
+  NULL so ensure_safe_net_sysctl() does not reject the table.
+- bpf: kernel.unprivileged_bpf_disabled writes from a non-init netns are
+  range-checked and dropped, so the privileged container cannot re-open
+  unprivileged eBPF on the host.
+- utsname: kernel.osrelease/version writable only inside a non-initial
+  UTS namespace (CAP_SYS_ADMIN over it); init_uts_ns stays read-only.
+  Used by an LXC start-host hook to present the stock GKI release.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kernel/bpf/syscall.c       | 20 +++++++++
+ kernel/utsname_sysctl.c    | 22 +++++++++-
+ net/core/sysctl_net_core.c | 84 +++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 123 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 96217b993..7a29e9c83 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -21,6 +21,8 @@
+ #include <linux/fs.h>
+ #include <linux/license.h>
+ #include <linux/filter.h>
++#include <linux/nsproxy.h>
++#include <net/net_namespace.h>
+ #include <linux/kernel.h>
+ #include <linux/idr.h>
+ #include <linux/cred.h>
+@@ -6720,6 +6722,24 @@ static int bpf_unpriv_handler(const struct ctl_table *table, int write,
+ 		return -EPERM;
+ 
+ 	tmp.data = &unpriv_enable;
++
++	/*
++	 * TB520FU: a privileged LXC Android container (Waydroid) shares the
++	 * host's /proc/sys/kernel and its netbpfload writes 0 here on every
++	 * boot, which would re-open unprivileged eBPF on the whole host.
++	 * Writes from a non-init network namespace are range-checked and then
++	 * dropped (reported as success so netbpfload carries on).  On this
++	 * kernel the knob only gates unprivileged BPF_MAP_CREATE/BPF_PROG_LOAD
++	 * (map_create(), bpf_prog_load()); Android loads everything as root.
++	 */
++	if (write && !net_eq(current->nsproxy->net_ns, &init_net)) {
++		ret = proc_dointvec_minmax(&tmp, write, buffer, lenp, ppos);
++		if (!ret)
++			pr_info_ratelimited("kernel.unprivileged_bpf_disabled: write %d from non-init netns ignored, host keeps %d\n",
++					    unpriv_enable, *(int *)table->data);
++		return ret;
++	}
++
+ 	ret = proc_dointvec_minmax(&tmp, write, buffer, lenp, ppos);
+ 	if (write && !ret) {
+ 		if (locked_state && unpriv_enable != 1)
+diff --git a/kernel/utsname_sysctl.c b/kernel/utsname_sysctl.c
+index 6c1522201..41eda94a9 100644
+--- a/kernel/utsname_sysctl.c
++++ b/kernel/utsname_sysctl.c
+@@ -12,6 +12,8 @@
+ #include <linux/sysctl.h>
+ #include <linux/wait.h>
+ #include <linux/rwsem.h>
++#include <linux/capability.h>
++#include <linux/user_namespace.h>
+ 
+ #ifdef CONFIG_SYSCTL
+ 
+@@ -37,6 +39,22 @@ static int proc_do_uts_string(const struct ctl_table *table, int write,
+ 	int r;
+ 	char tmp_data[__NEW_UTS_LEN + 1];
+ 
++	/*
++	 * TB520FU: osrelease/version are writable only inside a non-initial
++	 * UTS namespace, by CAP_SYS_ADMIN over that namespace.  The Waydroid
++	 * ZUI container's start-host hook uses this to present the stock GKI
++	 * release to Android userspace (uname(2), /proc/version, osrelease);
++	 * the host (init_uts_ns) is never affected.  Kernel-side checks such
++	 * as module vermagic use compile-time strings, not utsname().
++	 */
++	if (write && (table->data == init_uts_ns.name.release ||
++		      table->data == init_uts_ns.name.version)) {
++		struct uts_namespace *ns = current->nsproxy->uts_ns;
++
++		if (ns == &init_uts_ns || !ns_capable(ns->user_ns, CAP_SYS_ADMIN))
++			return -EPERM;
++	}
++
+ 	memcpy(&uts_table, table, sizeof(uts_table));
+ 	uts_table.data = tmp_data;
+ 
+@@ -94,14 +112,14 @@ static const struct ctl_table uts_kern_table[] = {
+ 		.procname	= "osrelease",
+ 		.data		= init_uts_ns.name.release,
+ 		.maxlen		= sizeof(init_uts_ns.name.release),
+-		.mode		= 0444,
++		.mode		= 0644,
+ 		.proc_handler	= proc_do_uts_string,
+ 	},
+ 	{
+ 		.procname	= "version",
+ 		.data		= init_uts_ns.name.version,
+ 		.maxlen		= sizeof(init_uts_ns.name.version),
+-		.mode		= 0444,
++		.mode		= 0644,
+ 		.proc_handler	= proc_do_uts_string,
+ 	},
+ 	{
+diff --git a/net/core/sysctl_net_core.c b/net/core/sysctl_net_core.c
+index eb35da355..e4e7651a7 100644
+--- a/net/core/sysctl_net_core.c
++++ b/net/core/sysctl_net_core.c
+@@ -787,15 +787,91 @@ static int __init fb_tunnels_only_for_init_net_sysctl_setup(char *str)
+ }
+ __setup("fb_tunnels=", fb_tunnels_only_for_init_net_sysctl_setup);
+ 
++#ifdef CONFIG_BPF_JIT
++/*
++ * TB520FU (Waydroid/LXC Android container): net.core.bpf_jit_enable and
++ * net.core.bpf_jit_kallsyms are host-global knobs that upstream registers in
++ * init_net only (net_core_table).  Android U+ netbpfload opens both O_WRONLY
++ * and aborts on ENOENT, so an Android container with its own netns can never
++ * load its BPF programs.  Expose mirrors in every non-init netns: reads report
++ * the host value, writes are range-checked and then dropped, so the container
++ * neither fails nor changes the host setting.
++ *
++ * .data stays NULL on purpose: ensure_safe_net_sysctl() refuses (WARN and
++ * -EACCES, i.e. netns creation fails) any writable non-init_net entry whose
++ * .data points at kernel global data.  The handlers reach the globals directly.
++ */
++static int bpf_jit_netns_mirror(const struct ctl_table *table, int write,
++				void *buffer, size_t *lenp, loff_t *ppos,
++				const int *global)
++{
++	struct ctl_table tmp = *table;
++	int val = READ_ONCE(*global);
++	int ret;
++
++	if (write && !capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	tmp.data = &val;
++	ret = proc_dointvec_minmax(&tmp, write, buffer, lenp, ppos);
++	if (write && !ret)
++		pr_info_ratelimited("net.core.%s: write %d from non-init netns ignored, host keeps %d\n",
++				    table->procname, val, READ_ONCE(*global));
++	return ret;
++}
++
++static int proc_bpf_jit_enable_netns(const struct ctl_table *table, int write,
++				     void *buffer, size_t *lenp, loff_t *ppos)
++{
++	return bpf_jit_netns_mirror(table, write, buffer, lenp, ppos,
++				    &bpf_jit_enable);
++}
++
++# ifdef CONFIG_HAVE_EBPF_JIT
++static int proc_bpf_jit_kallsyms_netns(const struct ctl_table *table, int write,
++				       void *buffer, size_t *lenp, loff_t *ppos)
++{
++	return bpf_jit_netns_mirror(table, write, buffer, lenp, ppos,
++				    &bpf_jit_kallsyms);
++}
++# endif
++
++static const struct ctl_table netns_bpf_jit_mirror_table[] = {
++	{
++		.procname	= "bpf_jit_enable",
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_bpf_jit_enable_netns,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_TWO,
++	},
++# ifdef CONFIG_HAVE_EBPF_JIT
++	{
++		.procname	= "bpf_jit_kallsyms",
++		.maxlen		= sizeof(int),
++		.mode		= 0600,
++		.proc_handler	= proc_bpf_jit_kallsyms_netns,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
++# endif
++};
++# define NETNS_BPF_JIT_MIRROR_N	ARRAY_SIZE(netns_bpf_jit_mirror_table)
++#else
++# define NETNS_BPF_JIT_MIRROR_N	0
++#endif
++
+ static const struct ctl_table *netns_core_table_dup(struct net *net)
+ {
+ 	size_t table_size = ARRAY_SIZE(netns_core_table);
+ 	struct ctl_table *tbl;
+ 	int i;
+ 
+-	tbl = kmemdup(netns_core_table, sizeof(netns_core_table), GFP_KERNEL);
++	tbl = kcalloc(table_size + NETNS_BPF_JIT_MIRROR_N, sizeof(*tbl),
++		      GFP_KERNEL);
+ 	if (!tbl)
+ 		return NULL;
++	memcpy(tbl, netns_core_table, sizeof(netns_core_table));
+ 
+ 	for (i = 0; i < table_size; ++i) {
+ 		if (tbl[i].data == &sysctl_wmem_max)
+@@ -806,6 +882,11 @@ static const struct ctl_table *netns_core_table_dup(struct net *net)
+ 	for (; i < table_size; ++i)
+ 		tbl[i].mode &= ~0222;
+ 
++#ifdef CONFIG_BPF_JIT
++	memcpy(tbl + table_size, netns_bpf_jit_mirror_table,
++	       sizeof(netns_bpf_jit_mirror_table));
++#endif
++
+ 	return tbl;
+ }
+ 
+@@ -819,6 +900,7 @@ static __net_init int sysctl_core_net_init(struct net *net)
+ 		tbl = netns_core_table_dup(net);
+ 		if (tbl == NULL)
+ 			goto err_dup;
++		table_size += NETNS_BPF_JIT_MIRROR_N;
+ 	}
+ 
+ 	net->core.sysctl_hdr = register_net_sysctl_sz(net, "net/core", tbl, table_size);

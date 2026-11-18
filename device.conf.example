@@ -1,0 +1,16 @@
+# TB520FU per-device settings. Copy to device.local.conf (never committed) and fill in.
+#
+# The factory addresses are unique to each tablet. Read them in Android:
+#   Bluetooth: Settings > About tablet > Status, or  adb shell settings get secure bluetooth_address
+#   Wi-Fi:     Settings > About tablet > Status, or  adb shell cat /sys/class/net/wlan0/address
+#              (with MAC randomisation on, use the device MAC, not the per-network one)
+# On the TB520FU the Wi-Fi MAC is the Bluetooth address + 1.
+#
+# Bluetooth address, written into the device tree at kernel build time
+# (tools/kernel/set-bdaddr.sh). Leave empty to keep the placeholder; the controller
+# then shows up unconfigured and needs `btmgmt public-addr` by hand.
+BT_ADDR=
+# Wi-Fi MAC, written into the systemd .link file when the system overlay is installed
+# (tools/deploy-daily/deploy-daily.sh). Leave empty to let the driver pick a random
+# address on every boot.
+WIFI_MAC=
